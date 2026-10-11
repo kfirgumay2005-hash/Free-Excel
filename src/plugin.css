@@ -88,6 +88,33 @@
 	font-size: var(--font-ui-smaller);
 }
 
+.rtl-spreadsheet-view .rtl-sheet-swatches {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+}
+
+.rtl-spreadsheet-view .rtl-sheet-swatch {
+	flex: 0 0 auto;
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: 1px solid var(--background-modifier-border-hover);
+	border-radius: var(--radius-s);
+	box-shadow: none;
+	background: var(--rtl-sheet-swatch);
+	cursor: pointer;
+}
+
+.rtl-spreadsheet-view .rtl-sheet-swatch:hover {
+	border-color: var(--text-normal);
+}
+
+.rtl-spreadsheet-view.is-touch .rtl-sheet-swatch {
+	width: 28px;
+	height: 28px;
+}
+
 .rtl-spreadsheet-view .rtl-sheet-select {
 	max-width: 120px;
 }
@@ -119,6 +146,85 @@
 	flex-wrap: wrap;
 	gap: 8px;
 	margin-top: 12px;
+}
+
+/* ---------- Find bar ---------- */
+
+.rtl-spreadsheet-view .rtl-sheet-find-bar {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 8px;
+	direction: ltr;
+	flex: 0 0 auto;
+	border-bottom: 1px solid var(--background-modifier-border);
+	background: var(--background-primary);
+}
+
+.rtl-spreadsheet-view .rtl-sheet-find-input {
+	flex: 0 1 260px;
+	min-width: 0;
+}
+
+.rtl-spreadsheet-view .rtl-sheet-find-count {
+	min-width: 64px;
+	font-size: var(--font-ui-small);
+	color: var(--text-muted);
+}
+
+/* !important: a cell's own fill color is an inline style. */
+.handsontable td.rtl-sheet-find-hit {
+	background-color: var(--text-highlight-bg) !important;
+}
+
+.handsontable td.rtl-sheet-find-current {
+	outline: 2px solid var(--interactive-accent);
+	outline-offset: -2px;
+}
+
+/* ---------- Filters ---------- */
+
+.handsontable th.rtl-sheet-filtered .colHeader {
+	color: var(--interactive-accent);
+	font-weight: var(--font-bold);
+}
+
+.handsontable th.rtl-sheet-filtered .colHeader::after {
+	content: ' \25BE';
+}
+
+.rtl-sheet-filter-tools {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 8px;
+}
+
+.rtl-sheet-filter-tools input {
+	flex: 1 1 140px;
+	min-width: 0;
+}
+
+.rtl-sheet-filter-values {
+	max-height: 40vh;
+	margin-top: 8px;
+	padding: 4px 8px;
+	overflow-y: auto;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+}
+
+.rtl-sheet-filter-value {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 3px 0;
+}
+
+.rtl-sheet-filter-note {
+	padding: 4px 0;
+	font-size: var(--font-ui-small);
+	color: var(--text-muted);
 }
 
 .rtl-sheet-rotated {
@@ -154,6 +260,62 @@
 	width: 100%;
 	height: 100%;
 	object-fit: contain;
+}
+
+/* Corner handles: drag one to resize the cell and the image in it. With a mouse a handle
+   shows when the pointer is over that corner; on touch screens all four show while the cell
+   is selected. */
+.rtl-sheet-img-handle {
+	position: absolute;
+	z-index: 2;
+	width: 12px;
+	height: 12px;
+	border: 2px solid var(--background-primary);
+	border-radius: 50%;
+	background: var(--interactive-accent);
+	opacity: 0;
+	touch-action: none;
+}
+
+.rtl-sheet-img-handle:hover {
+	opacity: 1;
+}
+
+.rtl-sheet-img-handle.is-nw {
+	top: 0;
+	left: 0;
+	cursor: nwse-resize;
+}
+
+.rtl-sheet-img-handle.is-ne {
+	top: 0;
+	right: 0;
+	cursor: nesw-resize;
+}
+
+.rtl-sheet-img-handle.is-sw {
+	bottom: 0;
+	left: 0;
+	cursor: nesw-resize;
+}
+
+.rtl-sheet-img-handle.is-se {
+	right: 0;
+	bottom: 0;
+	cursor: nwse-resize;
+}
+
+.rtl-spreadsheet-view.is-touch .rtl-sheet-img-handle {
+	width: 22px;
+	height: 22px;
+	pointer-events: none;
+}
+
+.rtl-spreadsheet-view.is-touch
+	td.rtl-sheet-img-active
+	.rtl-sheet-img-handle {
+	opacity: 1;
+	pointer-events: auto;
 }
 
 /* ---------- Function autocomplete popup (attached to <body>) ---------- */
@@ -218,6 +380,7 @@
 
 /* 16px prevents iOS from zooming the page when a field is focused. */
 .rtl-spreadsheet-view.is-touch .rtl-sheet-formula-input,
+.rtl-spreadsheet-view.is-touch .rtl-sheet-find-input,
 .rtl-spreadsheet-view.is-touch .rtl-sheet-select {
 	font-size: 16px;
 }

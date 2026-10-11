@@ -174,3 +174,76 @@ export function isEmptyFormat(f: CellFormat): boolean {
 export function cloneFormat(f: CellFormat): CellFormat {
 	return JSON.parse(JSON.stringify(f)) as CellFormat;
 }
+
+export type FilterCondition =
+	| 'none'
+	| 'contains'
+	| 'not-contains'
+	| 'equals'
+	| 'starts'
+	| 'ends'
+	| 'greater'
+	| 'less'
+	| 'empty'
+	| 'not-empty';
+
+export const FILTER_CONDITIONS: { value: FilterCondition; label: string }[] = [
+	{ value: 'none', label: 'No condition' },
+	{ value: 'contains', label: 'Contains' },
+	{ value: 'not-contains', label: 'Does not contain' },
+	{ value: 'equals', label: 'Equals' },
+	{ value: 'starts', label: 'Starts with' },
+	{ value: 'ends', label: 'Ends with' },
+	{ value: 'greater', label: 'Greater than' },
+	{ value: 'less', label: 'Less than' },
+	{ value: 'empty', label: 'Is empty' },
+	{ value: 'not-empty', label: 'Is not empty' },
+];
+
+/** A filter on one column. Filters only change the view: they are not saved in the file. */
+export interface ColumnFilter {
+	/** Cell texts that stay visible. null = every value. */
+	values: Set<string> | null;
+	condition: FilterCondition;
+	operand: string;
+}
+
+/** Text order used for sorting and for value lists: "item 2" comes before "item 10". */
+export function compareText(a: string, b: string): number {
+	return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+/** True when a cell showing `text` passes the filter. Text is compared without case. */
+export function filterAccepts(filter: ColumnFilter, text: string): boolean {
+	if (filter.values && !filter.values.has(text)) return false;
+	const value = text.trim().toLowerCase();
+	const operand = filter.operand.trim().toLowerCase();
+	switch (filter.condition) {
+		case 'none':
+			return true;
+		case 'empty':
+			return value === '';
+		case 'not-empty':
+			return value !== '';
+		case 'contains':
+			return value.includes(operand);
+		case 'not-contains':
+			return !value.includes(operand);
+		case 'equals':
+			return value === operand;
+		case 'starts':
+			return value.startsWith(operand);
+		case 'ends':
+			return value.endsWith(operand);
+		case 'greater':
+		case 'less': {
+			if (value === '') return false;
+			const bothNumbers =
+				NUMERIC_RE.test(value) && NUMERIC_RE.test(operand);
+			const order = bothNumbers
+				? Number(value) - Number(operand)
+				: compareText(value, operand);
+			return filter.condition === 'greater' ? order > 0 : order < 0;
+		}
+	}
+}

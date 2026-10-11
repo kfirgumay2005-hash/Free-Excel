@@ -1236,3 +1236,34 @@ export function buildFunctionCall(fn: FormulaFunctionInfo): FunctionCall {
 		selectTo: fn.name.length + 1 + args.length,
 	};
 }
+
+/**
+ * Moves the relative row references of a formula by `delta` rows, like Excel does when a
+ * row is moved by sorting. Absolute rows (A$1) and text in quotes are left alone.
+ */
+export function shiftFormulaRows(formula: string, delta: number): string {
+	if (delta === 0 || !formula.startsWith('=')) return formula;
+	return formula
+		.split(/("(?:[^"]|"")*")/)
+		.map((part, i) =>
+			i % 2 === 1
+				? part
+				: part.replace(
+						/(^|[^A-Za-z0-9_.$])(\$?[A-Za-z]{1,3})(\$?)(\d+)(?![A-Za-z0-9_(.])/g,
+						(
+							match: string,
+							before: string,
+							column: string,
+							absolute: string,
+							rowText: string,
+						) => {
+							if (absolute) return match;
+							const row = Number(rowText) + delta;
+							return row < 1
+								? `${before}#REF!`
+								: `${before}${column}${row}`;
+						},
+					),
+		)
+		.join('');
+}

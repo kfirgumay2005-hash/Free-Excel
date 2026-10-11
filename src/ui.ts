@@ -1,9 +1,17 @@
-import { App, FuzzySuggestModal, Modal, SuggestModal, TFile } from 'obsidian';
+import {
+	App,
+	FuzzySuggestModal,
+	Modal,
+	Setting,
+	SuggestModal,
+	TFile,
+} from 'obsidian';
 import {
 	FORMULA_FUNCTIONS,
 	FormulaFunctionInfo,
 	buildFunctionCall,
 } from './formulas';
+import { ColumnFilter, FILTER_CONDITIONS, FilterCondition } from './model';
 
 type TextField = HTMLInputElement | HTMLTextAreaElement;
 
@@ -370,5 +378,161 @@ export class ImportDirectionModal extends Modal {
 	onClose(): void {
 		this.contentEl.empty();
 		if (!this.chosen) this.onChoose(null); // dismissed: cancel the import
+	}
+}
+
+/** Most values listed at once in the filter dialog; the search box narrows longer lists. */
+const MAX_FILTER_VALUES = 500;
+
+/** Picks which rows stay visible by the values of one column: a condition, a list of values, or both. */
+export class ColumnFilterModal extends Modal {
+	private readonly heading: string;
+	private readonly values: string[];
+	private readonly onApply: (filter: ColumnFilter | null) => void;
+	private readonly checked: Set<string>;
+	private condition: FilterCondition;
+	private operand: string;
+	private search = '';
+	private listEl: HTMLElement | null = null;
+
+	constructor(
+		app: App,
+		heading: string,
+		values: string[],
+		current: ColumnFilter | null,
+		onApply: (filter: ColumnFilter | null) => void,
+	) {
+		super(app);
+		this.heading = heading;
+		this.values = values;
+		this.onApply = onApply;
+		const allowed = current?.values;
+		this.checked = new Set(
+			allowed ? values.filter((v) => allowed.has(v)) : values,
+		);
+		this.condition = current?.condition ?? 'none';
+		this.operand = current?.operand ?? '';
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass('rtl-sheet-filter-modal');
+		contentEl.createEl('h3', { text: this.heading });
+
+		new Setting(contentEl)
+			.setName('Condition')
+			.addDropdown((dropdown) => {
+				for (const c of FILTER_CONDITIONS)
+					dropdown.addOption(c.value, c.label);
+				dropdown.setValue(this.condition).onChange((value) => {
+					this.condition = value as FilterCondition;
+				});
+			})
+			.addText((text) => {
+				text.inputEl.setAttr('dir', 'auto');
+				text.setPlaceholder('Value')
+					.setValue(this.operand)
+					.onChange((value) => {
+						this.operand = value;
+					});
+			});
+
+		const tools = contentEl.createDiv({ cls: 'rtl-sheet-filter-tools' });
+		const searchEl = tools.createEl('input', {
+			type: 'text',
+			attr: { placeholder: 'Search values', dir: 'auto' },
+		});
+		searchEl.addEventListener('input', () => {
+			this.search = searchEl.value.toLowerCase();
+			this.renderList();
+		});
+		const setAll = (on: boolean): void => {
+			for (const v of this.matching()) {
+				if (on) this.checked.add(v);
+				else this.checked.delete(v);
+			}
+			this.renderList();
+		};
+		tools
+			.createEl('button', { text: 'Select all' })
+			.addEventListener('click', () => setAll(true));
+		tools
+			.createEl('button', { text: 'Clear' })
+			.addEventListener('click', () => setAll(false));
+
+		this.listEl = contentEl.createDiv({ cls: 'rtl-sheet-filter-values' });
+		this.renderList();
+
+		const buttons = contentEl.createDiv({
+			cls: 'rtl-sheet-import-choices',
+		});
+		buttons
+			.createEl('button', { text: 'Apply', cls: 'mod-cta' })
+			.addEventListener('click', () => {
+				const all = this.checked.size === this.values.length;
+				const active = !all || this.condition !== 'none';
+				this.close();
+				this.onApply(
+					active
+						? {
+								values: all ? null : new Set(this.checked),
+								condition: this.condition,
+								operand: this.operand,
+							}
+						: null,
+				);
+			});
+		buttons
+			.createEl('button', { text: 'Remove filter' })
+			.addEventListener('click', () => {
+				this.close();
+				this.onApply(null);
+			});
+		buttons
+			.createEl('button', { text: 'Cancel' })
+			.addEventListener('click', () => this.close());
+	}
+
+	private matching(): string[] {
+		return this.search
+			? this.values.filter((v) => v.toLowerCase().includes(this.search))
+			: this.values;
+	}
+
+	private renderList(): void {
+		const list = this.listEl;
+		if (!list) return;
+		list.empty();
+		const matching = this.matching();
+		for (const value of matching.slice(0, MAX_FILTER_VALUES)) {
+			const row = list.createEl('label', {
+				cls: 'rtl-sheet-filter-value',
+			});
+			const box = row.createEl('input', { type: 'checkbox' });
+			box.checked = this.checked.has(value);
+			box.addEventListener('change', () => {
+				if (box.checked) this.checked.add(value);
+				else this.checked.delete(value);
+			});
+			row.createSpan({
+				text: value === '' ? '(Blanks)' : value,
+				attr: { dir: 'auto' },
+			});
+		}
+		if (matching.length === 0)
+			list.createDiv({
+				cls: 'rtl-sheet-filter-note',
+				text: 'No values.',
+			});
+		else if (matching.length > MAX_FILTER_VALUES)
+			list.createDiv({
+				cls: 'rtl-sheet-filter-note',
+				text: `Showing the first ${MAX_FILTER_VALUES} of ${matching.length} values. Search to narrow the list.`,
+			});
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }

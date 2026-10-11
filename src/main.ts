@@ -17,6 +17,7 @@ import './plugin.css';
 import ExcelJS from 'exceljs';
 import {
 	DEFAULT_SETTINGS,
+	MAX_SAVED_COLORS,
 	PluginSettings,
 	SettingsTab,
 	sanitizeSettings,
@@ -24,8 +25,10 @@ import {
 import {
 	CellBorders,
 	CellFormat,
+	ColumnFilter,
 	DEFAULT_COL_WIDTH,
 	FONT_SIZES,
+	ImageSizeRecord,
 	MergeInfo,
 	NUMERIC_RE,
 	ROTATIONS,
@@ -37,8 +40,10 @@ import {
 	MIN_ZOOM,
 	ROW_LINE_HEIGHT,
 	ROW_VERTICAL_PADDING,
+	compareText,
 	createDefaultModel,
 	defaultSheetRtl,
+	filterAccepts,
 	indexToColumnLabel,
 	isEmptyFormat,
 	key,
@@ -51,9 +56,11 @@ import {
 	evaluateFormula,
 	normalizeSeparators,
 	referenceSlot,
+	shiftFormulaRows,
 } from './formulas';
 import { ImportedSheet, parseCsv, parseXlsx } from './xlsx';
 import {
+	ColumnFilterModal,
 	FormulaAutocomplete,
 	FunctionPickerModal,
 	ImportDirectionChoice,
@@ -71,6 +78,11 @@ const SHEET_EXT = 'sheet';
 const FALLBACK_SHEET_EXT = 'rtlsheet';
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'];
 const MAX_IMAGE_CELL_PX = 240;
+/** Limits (unzoomed px) for a cell that is resized by dragging a corner of its image. */
+const MIN_IMAGE_RESIZE_PX = 24;
+const MAX_IMAGE_RESIZE_PX = 2000;
+/** The corners of an image cell that have a resize handle (physical sides). */
+const IMAGE_CORNERS = ['nw', 'ne', 'sw', 'se'] as const;
 /** Extra px added to measured text when a column is widened to fit it. */
 const EXPAND_PADDING = 18;
 const MAX_EXPAND_WIDTH = 600;
@@ -160,6 +172,32 @@ function rotationToExcel(rotate: number | undefined): number | undefined {
 	if (!rotate) return undefined;
 	if (rotate > 0) return rotate;
 	return 90 + Math.abs(rotate);
+}
+
+/** True for fields the user types text into, where Ctrl+Z belongs to the field itself. */
+function isTextEntry(el: HTMLElement): boolean {
+	if (el.isContentEditable || el.tagName === 'TEXTAREA') return true;
+	if (el.tagName !== 'INPUT') return false;
+	return !['color', 'checkbox', 'radio', 'button', 'range', 'file'].includes(
+		(el as HTMLInputElement).type,
+	);
+}
+
+/** Sort order like Excel: numbers, then text, then TRUE/FALSE; empty cells always come last. */
+function compareForSort(a: Scalar, b: Scalar, descending: boolean): number {
+	const blankA = a === null || a === '';
+	const blankB = b === null || b === '';
+	if (blankA || blankB) return Number(blankA) - Number(blankB);
+	const rank = (v: Scalar): number =>
+		typeof v === 'number' ? 0 : typeof v === 'string' ? 1 : 2;
+	let order = rank(a) - rank(b);
+	if (order === 0) {
+		order =
+			typeof a === 'string' && typeof b === 'string'
+				? compareText(a, b)
+				: Number(a) - Number(b);
+	}
+	return descending ? -order : order;
 }
 
 function decodeText(data: ArrayBuffer): string {
@@ -318,6 +356,10 @@ export default class RtlSpreadsheetPlugin extends Plugin {
 
 const baseTextRenderer = Handsontable.renderers.getRenderer('text');
 
+/** The color pickers in the toolbar; fill and text also have saved colors. */
+type ColorKind = 'fill' | 'text' | 'border';
+type PaletteKind = 'fill' | 'text';
+
 interface ToolbarRefs {
 	toggles: Record<string, HTMLButtonElement>;
 	fontSelect?: HTMLSelectElement;
@@ -326,12 +368,100 @@ interface ToolbarRefs {
 	address?: HTMLElement;
 	formulaInput?: HTMLInputElement;
 	zoomLabel?: HTMLButtonElement;
+	/** The saved-color swatches next to the fill and text color pickers. */
+	palettes: Partial<
+		Record<
+			PaletteKind,
+			{
+				el: HTMLElement;
+				input: HTMLInputElement;
+				setColor: (f: CellFormat, color: string) => void;
+			}
+		>
+	>;
+	filterBtn?: HTMLButtonElement;
+	findInput?: HTMLInputElement;
+	findCount?: HTMLElement;
 }
 
 interface MenuEntry {
 	title: string;
 	icon: string;
 	onClick: () => void;
+	/** Shows a check mark next to an on/off entry. */
+	checked?: boolean;
+}
+
+/** A step on Handsontable's undo stack: one of its own, or one that this plugin added. */
+interface UndoStep {
+	actionType: string;
+	undo(hot: Handsontable.Core, done: () => void): void;
+	redo(hot: Handsontable.Core, done: () => void): void;
+}
+
+/** The parts of Handsontable's UndoRedo plugin that are used here. */
+interface UndoRedoPlugin {
+	undo(): void;
+	redo(): void;
+	clear(): void;
+	done(wrappedAction: () => UndoStep, source?: string): void;
+	ignoreNewActions: boolean;
+	doneActions: unknown[];
+	undoneActions: unknown[];
+}
+
+/**
+ * The saved parts of the model that Handsontable knows nothing about, and so cannot undo:
+ * everything except the cell values, the merges and the direction.
+ */
+interface SideState {
+	formats: Record<string, CellFormat>;
+	images: Record<string, string>;
+	imageSizes: Record<string, ImageSizeRecord>;
+	/** As JSON: these records are changed in place. */
+	widenRecords: string;
+	colWidths: (number | null)[];
+	rowHeights: (number | null)[];
+}
+
+/** Formats and image sizes are compared by identity: they are replaced, never changed in place. */
+function sameSideState(a: SideState, b: SideState): boolean {
+	const sameRecord = (
+		x: Record<string, unknown>,
+		y: Record<string, unknown>,
+	): boolean => {
+		const keys = Object.keys(x);
+		return (
+			keys.length === Object.keys(y).length &&
+			keys.every((k) => x[k] === y[k])
+		);
+	};
+	const sameSizes = (
+		x: (number | null)[],
+		y: (number | null)[],
+	): boolean => {
+		for (let i = Math.max(x.length, y.length) - 1; i >= 0; i--)
+			if ((x[i] || null) !== (y[i] || null)) return false;
+		return true;
+	};
+	return (
+		sameRecord(a.formats, b.formats) &&
+		sameRecord(a.images, b.images) &&
+		sameRecord(a.imageSizes, b.imageSizes) &&
+		a.widenRecords === b.widenRecords &&
+		sameSizes(a.colWidths, b.colWidths) &&
+		sameSizes(a.rowHeights, b.rowHeights)
+	);
+}
+
+/** Everything that belongs to a set of rows, so the rows can be moved and put back. */
+interface RowsSnapshot {
+	rows: number[];
+	data: Scalar[][];
+	formats: Record<string, CellFormat>;
+	images: Record<string, string>;
+	imageSizes: Record<string, ImageSizeRecord>;
+	heights: (number | null)[];
 }
 
 export class SheetView extends TextFileView {
@@ -342,6 +472,7 @@ export class SheetView extends TextFileView {
 	private gridForCalc: Handsontable.Core | null = null;
 	private formulaBarEl: HTMLElement;
 	private toolbarEl: HTMLElement;
+	private findBarEl: HTMLElement;
 	private gridEl: HTMLElement;
 	private loading = false;
 	private dirty = false;
@@ -351,7 +482,7 @@ export class SheetView extends TextFileView {
 	private refreshTimer = 0;
 	private refreshing = false;
 
-	private readonly ui: ToolbarRefs = { toggles: {} };
+	private readonly ui: ToolbarRefs = { toggles: {}, palettes: {} };
 	private readonly autocomplete = new FormulaAutocomplete();
 	/** Top-left cell of the current selection (shown in the formula bar). */
 	private formulaCell: { row: number; col: number } | null = null;
@@ -368,6 +499,32 @@ export class SheetView extends TextFileView {
 	private writingRefPick = false;
 	/** Formatting copied by the format painter; null when the painter is off. */
 	private painterSource: CellFormat | null = null;
+	/** The side state as it was after the last recorded action (see recordSideChanges). */
+	private sideBaseline: SideState | null = null;
+	private sideCheckQueued = false;
+	/** True while one of our undo steps is running: nothing is recorded meanwhile. */
+	private sideBusy = false;
+	/** Undo steps that were already looked at, so new ones can be told apart. */
+	private knownSteps = new WeakSet<object>();
+	/** Set before markDirty() when the change may extend the previous step (same tag, in time). */
+	private coalesce: { tag: string; windowMs: number } | null = null;
+	private lastSideStep: {
+		step: UndoStep;
+		tag: string;
+		time: number;
+		state: { before: SideState; after: SideState };
+	} | null = null;
+
+	/** Column filters (column index -> filter). They hide rows in the view and are not saved. */
+	private filters = new Map<number, ColumnFilter>();
+	/** Sorting and filtering leave the first row in place when it holds the column titles. */
+	private hasHeaderRow = true;
+	/** Cells that match the find bar: all of them in row order, and their "row,col" keys. */
+	private findMatches: { row: number; col: number }[] = [];
+	private findHits = new Set<string>();
+	private findIndex = -1;
+	/** Set when cells changed while the find bar was open; the next step searches again. */
+	private findStale = false;
 
 	/** View zoom (0.5-3). Scales column widths, row heights and fonts; it is not saved in the file. */
 	private zoom = 1;
@@ -393,10 +550,18 @@ export class SheetView extends TextFileView {
 			cls: 'rtl-sheet-formula-bar',
 		});
 		this.toolbarEl = this.contentEl.createDiv({ cls: 'rtl-sheet-toolbar' });
+		this.findBarEl = this.contentEl.createDiv({
+			cls: 'rtl-sheet-find-bar',
+		});
 		this.gridEl = this.contentEl.createDiv({ cls: 'rtl-sheet-grid' });
 
 		this.buildFormulaBar();
 		this.buildToolbar();
+		this.buildFindBar();
+		// Capture phase, so the keys are seen before Handsontable and whatever has the focus.
+		this.registerDomEvent(document, 'keydown', (e) => this.onViewKeyDown(e), {
+			capture: true,
+		});
 		this.applyToolbarScale();
 		this.installAutosave();
 		this.installRefreshTimer();
@@ -423,6 +588,22 @@ export class SheetView extends TextFileView {
 			if (this.hasImageFile(e)) e.preventDefault();
 		});
 		this.registerDomEvent(this.gridEl, 'drop', (e) => this.onDrop(e));
+
+		// Corner handles of images. Registered before the other press handlers, in the capture
+		// phase, so neither they nor Handsontable see a press on a handle.
+		this.registerDomEvent(
+			this.gridEl,
+			'pointerdown',
+			(e) => this.onImageHandlePress(e),
+			{ capture: true },
+		);
+		for (const type of ['mousedown', 'touchstart', 'touchend'] as const)
+			this.registerDomEvent(
+				this.gridEl,
+				type,
+				(e) => this.keepHandlePress(e),
+				{ capture: true, passive: type !== 'mousedown' },
+			);
 
 		// While a formula is typed, a press on a cell inserts its reference. Capture phase so
 		// Handsontable does not see the press (it would close the editor and move the selection).
@@ -558,6 +739,7 @@ export class SheetView extends TextFileView {
 			}
 			const next = this.normalizeModel(parsed);
 			this.diskData = data;
+			if (clear) this.filters.clear(); // another file: its columns mean something else
 			// Same file, new content: update the live grid so selection and scroll stay put.
 			if (clear || !this.applyModelInPlace(next)) {
 				// Drop the old grid first, rebuildGrid() would copy its stale cells into the new model.
@@ -573,6 +755,7 @@ export class SheetView extends TextFileView {
 
 	clear(): void {
 		this.destroyGrid();
+		this.filters.clear();
 		this.model = createDefaultModel(
 			this.plugin.settings,
 			defaultSheetRtl(),
@@ -681,7 +864,9 @@ export class SheetView extends TextFileView {
 
 	private markDirty(): void {
 		this.rowIndex = null;
+		this.findStale = true;
 		if (this.loading) return;
+		this.queueSideCheck();
 		this.dirty = true;
 		if (this.plugin.settings.autosave) this.requestSave();
 	}
@@ -699,6 +884,8 @@ export class SheetView extends TextFileView {
 
 		if (!prev.autosave && s.autosave && this.dirty) this.requestSave();
 		this.applyToolbarScale();
+		this.renderPalette('fill');
+		this.renderPalette('text');
 
 		if (
 			prev.defaultFontSize !== s.defaultFontSize ||
@@ -791,6 +978,9 @@ export class SheetView extends TextFileView {
 			else this.clearRowHeight(i);
 		}
 
+		// The undo history describes the sheet as it was before the outside change.
+		this.undoPlugin()?.clear();
+		this.resetSideBaseline();
 		hot.render();
 		this.refreshToolbarState();
 		return true;
@@ -949,8 +1139,16 @@ export class SheetView extends TextFileView {
 		this.gridEl.empty();
 	}
 
-	private rebuildGrid(): void {
+	/**
+	 * `keepHistory` carries the undo history over to the new grid. Only for a rebuild of the
+	 * same sheet (a direction change), where the old steps still describe the cells.
+	 */
+	private rebuildGrid(keepHistory = false): void {
 		this.captureGridStateIfLive();
+		const old = keepHistory ? this.undoPlugin() : null;
+		const history = old
+			? { done: [...old.doneActions], undone: [...old.undoneActions] }
+			: null;
 		this.destroyGrid();
 
 		const m = this.model;
@@ -981,6 +1179,19 @@ export class SheetView extends TextFileView {
 				rowHeights: (row: number) =>
 					Math.round(this.computeRowHeight(row) * this.zoom),
 				mergeCells: m.merges,
+				// Filters hide rows instead of trimming them, so a row keeps its index and the
+				// "row,col" keys and formula references stay valid.
+				hiddenRows: {
+					rows: [],
+					indicators: true,
+					copyPasteEnabled: false,
+				},
+				afterGetColHeader: (col, th) => {
+					th.classList.toggle(
+						'rtl-sheet-filtered',
+						this.filters.has(col),
+					);
+				},
 				contextMenu: [
 					'row_above',
 					'row_below',
@@ -1060,6 +1271,7 @@ export class SheetView extends TextFileView {
 				afterCreateCol: (index, amount) => {
 					if (this.loading) return;
 					this.remapCellMaps('col', index, amount, 'insert');
+					this.remapFilters(index, amount, 'insert');
 					this.spliceSizes(
 						this.model.colWidths,
 						index,
@@ -1071,6 +1283,7 @@ export class SheetView extends TextFileView {
 				afterRemoveCol: (index, amount) => {
 					if (this.loading) return;
 					this.remapCellMaps('col', index, amount, 'remove');
+					this.remapFilters(index, amount, 'remove');
 					this.spliceSizes(
 						this.model.colWidths,
 						index,
@@ -1095,6 +1308,14 @@ export class SheetView extends TextFileView {
 					);
 					this.markDirty();
 				},
+				// Handsontable's own steps move formats and sizes through the hooks above:
+				// that is part of the undo, not a new change to record.
+				afterUndo: () => {
+					if (!this.sideBusy) this.resetSideBaseline();
+				},
+				afterRedo: () => {
+					if (!this.sideBusy) this.resetSideBaseline();
+				},
 				afterMergeCells: () => this.markDirty(),
 				afterUnmergeCells: () => this.markDirty(),
 				afterAutofill: (_fillData, sourceRange, targetRange) => {
@@ -1106,6 +1327,17 @@ export class SheetView extends TextFileView {
 			// The first render ran before `this.hot` existed; render again so formulas see all cells.
 			if (this.plugin.settings.enableFormulas) this.hot.render();
 			this.formulaCell = null;
+			const undo = this.undoPlugin();
+			if (history && undo) {
+				undo.doneActions.push(...history.done);
+				undo.undoneActions.push(...history.undone);
+			} else {
+				this.knownSteps = new WeakSet();
+				this.lastSideStep = null;
+			}
+			this.resetSideBaseline();
+			this.applyFilters(); // the new grid starts with every row visible
+			if (this.findBarEl.isShown()) this.runFind();
 			this.refreshToolbarState();
 		} catch (e) {
 			this.plugin.reportError('Could not create the spreadsheet grid', e);
@@ -1493,7 +1725,11 @@ export class SheetView extends TextFileView {
 
 		baseTextRenderer(instance, td, row, col, prop, text, cellProperties);
 		// Image cells are read-only, but they should not be greyed out like other read-only cells.
-		td.classList.remove('htDimmed', 'rtl-sheet-img-cell');
+		td.classList.remove(
+			'htDimmed',
+			'rtl-sheet-img-cell',
+			'rtl-sheet-img-active',
+		);
 		const picked = this.refPick?.range;
 		td.classList.toggle(
 			'rtl-sheet-ref-pick',
@@ -1502,6 +1738,15 @@ export class SheetView extends TextFileView {
 				row <= picked.r2 &&
 				col >= picked.c1 &&
 				col <= picked.c2,
+		);
+		const found = this.findMatches[this.findIndex];
+		td.classList.toggle(
+			'rtl-sheet-find-hit',
+			this.findHits.has(key(row, col)),
+		);
+		td.classList.toggle(
+			'rtl-sheet-find-current',
+			!!found && found.row === row && found.col === col,
 		);
 		td.querySelectorAll('.rtl-sheet-spill-eraser').forEach((el) =>
 			el.remove(),
@@ -1544,6 +1789,11 @@ export class SheetView extends TextFileView {
 
 		if (imagePath) {
 			this.renderImage(td, imagePath);
+			const active = this.formulaCell;
+			td.classList.toggle(
+				'rtl-sheet-img-active',
+				!!active && active.row === row && active.col === col,
+			);
 		} else if (f?.rotate) {
 			this.renderRotated(td, text, f.rotate);
 		} else if (wrap === 'overflow') {
@@ -1656,6 +1906,119 @@ export class SheetView extends TextFileView {
 				draggable: 'false',
 			},
 		});
+		// Drag a corner to resize the cell, and the image with it (see onImageHandlePress).
+		for (const corner of IMAGE_CORNERS)
+			td.createDiv({
+				cls: `rtl-sheet-img-handle is-${corner}`,
+				attr: { 'data-corner': corner },
+			});
+	}
+
+	/** Marks the selected image cell: on touch screens its resize handles show while it is selected. */
+	private markActiveImageCell(): void {
+		const hot = this.hot;
+		this.gridEl
+			.querySelectorAll('td.rtl-sheet-img-active')
+			.forEach((el) => el.classList.remove('rtl-sheet-img-active'));
+		const cell = this.formulaCell;
+		if (!hot || hot.isDestroyed || !cell) return;
+		if (!this.model.images[key(cell.row, cell.col)]) return;
+		hot.getCell(cell.row, cell.col)?.classList.add('rtl-sheet-img-active');
+	}
+
+	/**
+	 * A press on a corner handle of an image starts resizing its cell. The row and the column
+	 * grow together, so the cell keeps its proportions and the image keeps filling it.
+	 */
+	private onImageHandlePress(e: PointerEvent): void {
+		const handle =
+			e.target instanceof HTMLElement
+				? e.target.closest<HTMLElement>('.rtl-sheet-img-handle')
+				: null;
+		const hot = this.hot;
+		const td = handle?.closest('td');
+		if (!handle || !td || !hot || hot.isDestroyed) return;
+		if (e.pointerType === 'mouse' && e.button !== 0) return;
+		const coords = hot.getCoords(td);
+		const row = Number(coords?.row ?? -1);
+		const col = Number(coords?.col ?? -1);
+		if (row < 0 || col < 0) return;
+		// Keep the press away from Handsontable (it would start selecting cells).
+		e.preventDefault();
+		e.stopImmediatePropagation();
+
+		const corner = handle.dataset.corner ?? 'se';
+		const signX = corner.endsWith('e') ? 1 : -1;
+		const signY = corner.startsWith('s') ? 1 : -1;
+		const startX = e.clientX;
+		const startY = e.clientY;
+		const startW =
+			this.model.colWidths[col] || hot.getColWidth(col) / this.zoom;
+		const startH =
+			this.model.rowHeights[row] ||
+			(hot.getRowHeight(row) ?? 0) / this.zoom ||
+			this.computeRowHeight(row);
+		let width = startW;
+		let height = startH;
+		let frame = 0;
+		let changed = false;
+
+		const apply = (): void => {
+			frame = 0;
+			if (hot.isDestroyed) return;
+			this.setColumnWidth(col, width);
+			this.setRowHeight(row, height);
+			this.invalidateRowSizes();
+			hot.render();
+		};
+		const onMove = (ev: PointerEvent): void => {
+			if (ev.pointerId !== e.pointerId) return;
+			ev.preventDefault();
+			const dx = ((ev.clientX - startX) * signX) / this.zoom;
+			const dy = ((ev.clientY - startY) * signY) / this.zoom;
+			const factor = Math.min(
+				MAX_IMAGE_RESIZE_PX / Math.max(startW, startH),
+				Math.max(
+					MIN_IMAGE_RESIZE_PX / Math.min(startW, startH),
+					(startW + dx) / startW,
+					(startH + dy) / startH,
+				),
+			);
+			width = Math.round(startW * factor);
+			height = Math.round(startH * factor);
+			changed = true;
+			if (!frame) frame = window.requestAnimationFrame(apply);
+		};
+		const doc = this.gridEl.ownerDocument;
+		const onEnd = (ev: PointerEvent): void => {
+			if (ev.pointerId !== e.pointerId) return;
+			doc.removeEventListener('pointermove', onMove);
+			doc.removeEventListener('pointerup', onEnd);
+			doc.removeEventListener('pointercancel', onEnd);
+			if (frame) window.cancelAnimationFrame(frame);
+			if (!changed || hot.isDestroyed) return;
+			apply();
+			// The size is still "the image's size", so removing the image restores the old one.
+			const k = key(row, col);
+			const rec = this.model.imageSizes[k];
+			if (rec && this.model.images[k])
+				this.model.imageSizes[k] = { ...rec, w: width, h: height };
+			this.markDirty(); // one undo step for the whole drag
+		};
+		doc.addEventListener('pointermove', onMove, { passive: false });
+		doc.addEventListener('pointerup', onEnd);
+		doc.addEventListener('pointercancel', onEnd);
+	}
+
+	/** Mouse and touch events that follow a press on an image handle must not reach the grid. */
+	private keepHandlePress(e: Event): void {
+		if (
+			e.target instanceof HTMLElement &&
+			e.target.closest('.rtl-sheet-img-handle')
+		) {
+			if (e.cancelable && e.type === 'mousedown') e.preventDefault();
+			e.stopImmediatePropagation();
+		}
 	}
 
 	/* ---------------- Formula bar ---------------- */
@@ -1766,6 +2129,7 @@ export class SheetView extends TextFileView {
 		const tb = this.toolbarEl;
 		tb.empty();
 		this.ui.toggles = {};
+		this.ui.palettes = {};
 		const group = (): HTMLElement =>
 			tb.createDiv({ cls: 'rtl-sheet-toolbar-group' });
 
@@ -1816,28 +2180,24 @@ export class SheetView extends TextFileView {
 			'Fill',
 			'Cell fill color',
 			'#ffff00',
-			(ranges, color) =>
-				this.applyFormat(ranges, (f) => {
-					f.bgColor = color;
-				}),
-		);
-		this.addButton(g, 'eraser', 'x', 'Clear fill color', () =>
-			this.applyFormat(this.requireSelection(), (f) => {
-				delete f.bgColor;
-			}),
+			'fill',
+			(f, color) => {
+				f.bgColor = color;
+			},
 		);
 		this.addColorPicker(
 			g,
 			'Text',
 			'Text color',
 			'#d00000',
-			(ranges, color) =>
-				this.applyFormat(ranges, (f) => {
-					f.textColor = color;
-				}),
+			'text',
+			(f, color) => {
+				f.textColor = color;
+			},
 		);
-		this.addButton(g, 'eraser', 'x', 'Clear text color', () =>
+		this.addButton(g, 'eraser', 'x', 'Clear fill and text color', () =>
 			this.applyFormat(this.requireSelection(), (f) => {
+				delete f.bgColor;
 				delete f.textColor;
 			}),
 		);
@@ -1989,18 +2349,88 @@ export class SheetView extends TextFileView {
 			'Border',
 			'Border color',
 			'#000000',
-			(ranges, color) =>
-				this.applyFormat(ranges, (f) => {
-					f.borders = {
-						top: true,
-						right: true,
-						bottom: true,
-						left: true,
-						...(f.borders ?? {}),
-						color,
-					};
-				}),
+			'border',
+			(f, color) => {
+				f.borders = {
+					top: true,
+					right: true,
+					bottom: true,
+					left: true,
+					...(f.borders ?? {}),
+					color,
+				};
+			},
 		);
+
+		g = group();
+		const sortBtn: HTMLButtonElement = this.addButton(
+			g,
+			'arrow-up-down',
+			'Sort',
+			'Sort rows by the column of the selected cell',
+			() => {
+				const column = this.activeColumnName();
+				this.showMenu(sortBtn, [
+					{
+						title: `Sort by ${column}, A to Z`,
+						icon: 'arrow-down-a-z',
+						onClick: () => this.sortByColumn(false),
+					},
+					{
+						title: `Sort by ${column}, Z to A`,
+						icon: 'arrow-up-a-z',
+						onClick: () => this.sortByColumn(true),
+					},
+					this.headerRowEntry(),
+				]);
+			},
+		);
+		const filterBtn: HTMLButtonElement = this.addButton(
+			g,
+			'filter',
+			'Filter',
+			'Filter rows by the column of the selected cell',
+			() => {
+				const column = this.activeColumnName();
+				const col = this.formulaCell?.col ?? -1;
+				const entries: MenuEntry[] = [
+					{
+						title: `Filter ${column}…`,
+						icon: 'filter',
+						onClick: () => this.openColumnFilter(),
+					},
+				];
+				if (this.filters.has(col))
+					entries.push({
+						title: `Remove the filter from ${column}`,
+						icon: 'filter-x',
+						onClick: () => this.setColumnFilter(col, null),
+					});
+				if (this.filters.size > 0)
+					entries.push(
+						{
+							title: 'Apply filters again',
+							icon: 'refresh-cw',
+							onClick: () => this.applyFilters(),
+						},
+						{
+							title: 'Remove all filters',
+							icon: 'filter-x',
+							onClick: () => {
+								this.filters.clear();
+								this.applyFilters();
+							},
+						},
+					);
+				entries.push(this.headerRowEntry());
+				this.showMenu(filterBtn, entries);
+			},
+		);
+		this.ui.filterBtn = filterBtn;
+		this.addButton(g, 'search', 'Find', 'Find in sheet (Ctrl+F)', () => {
+			if (this.findBarEl.isShown()) this.closeFind();
+			else this.openFind();
+		});
 
 		g = group();
 		const imageBtn: HTMLButtonElement = this.addButton(
@@ -2187,7 +2617,8 @@ export class SheetView extends TextFileView {
 		label: string,
 		title: string,
 		initial: string,
-		onPick: (ranges: SelRange[], color: string) => void,
+		kind: ColorKind,
+		setColor: (f: CellFormat, color: string) => void,
 	): void {
 		const wrap = parent.createEl('label', {
 			cls: 'rtl-sheet-color',
@@ -2197,8 +2628,101 @@ export class SheetView extends TextFileView {
 		const input = wrap.createEl('input', { type: 'color' });
 		input.value = initial;
 		this.bindRangeControl(input, 'input', (ranges) =>
-			onPick(ranges, input.value),
+			this.applyFormat(ranges, (f) => setColor(f, input.value), kind),
 		);
+		if (kind === 'border') return;
+
+		// Saved colors: one click applies a color without opening the picker.
+		this.ui.palettes[kind] = {
+			el: parent.createDiv({ cls: 'rtl-sheet-swatches' }),
+			input,
+			setColor,
+		};
+		const manageBtn: HTMLButtonElement = this.addButton(
+			parent,
+			'plus',
+			'+',
+			`Save the current ${label.toLowerCase()} color, or remove a saved one`,
+			() => this.showPaletteMenu(kind, manageBtn),
+		);
+		this.renderPalette(kind);
+	}
+
+	private savedColors(kind: PaletteKind): string[] {
+		const s = this.plugin.settings;
+		return kind === 'fill' ? s.savedFillColors : s.savedTextColors;
+	}
+
+	/** Saved colors are a plugin setting, so every sheet shows the same ones. */
+	private setSavedColors(kind: PaletteKind, colors: string[]): void {
+		if (kind === 'fill') this.plugin.settings.savedFillColors = colors;
+		else this.plugin.settings.savedTextColors = colors;
+		void this.plugin
+			.saveSettings()
+			.catch((e) =>
+				this.plugin.reportError('Could not save the colors', e),
+			);
+	}
+
+	private renderPalette(kind: PaletteKind): void {
+		const palette = this.ui.palettes[kind];
+		if (!palette) return;
+		palette.el.empty();
+		const colors = this.savedColors(kind);
+		for (const color of colors) {
+			const hint = `Apply ${color} (right-click to remove it)`;
+			const swatch = palette.el.createEl('button', {
+				cls: 'rtl-sheet-swatch',
+				attr: { 'aria-label': hint, title: hint },
+			});
+			swatch.setCssProps({ '--rtl-sheet-swatch': color });
+			// Keep the grid selection intact while clicking.
+			swatch.addEventListener('mousedown', (e) => e.preventDefault());
+			swatch.addEventListener('click', () => {
+				palette.input.value = color;
+				this.applyFormat(this.requireSelection(), (f) =>
+					palette.setColor(f, color),
+				);
+			});
+			swatch.addEventListener('contextmenu', (e) => {
+				e.preventDefault();
+				this.setSavedColors(
+					kind,
+					colors.filter((c) => c !== color),
+				);
+			});
+		}
+	}
+
+	private showPaletteMenu(kind: PaletteKind, anchor: HTMLElement): void {
+		const palette = this.ui.palettes[kind];
+		if (!palette) return;
+		const colors = this.savedColors(kind);
+		const current = palette.input.value.toLowerCase();
+		this.showMenu(anchor, [
+			{
+				title: `Save ${current}`,
+				icon: 'plus',
+				onClick: () => {
+					if (colors.includes(current))
+						new Notice('This color is already saved.');
+					else if (colors.length >= MAX_SAVED_COLORS)
+						new Notice(
+							`You can save up to ${MAX_SAVED_COLORS} colors. Remove one first.`,
+						);
+					else this.setSavedColors(kind, [...colors, current]);
+				},
+			},
+			...colors.map((color) => ({
+				title: `Remove ${color}`,
+				icon: 'trash-2',
+				onClick: () =>
+					this.setSavedColors(
+						kind,
+						colors.filter((c) => c !== color),
+					),
+			})),
+		]);
 	}
 
 	private addSelect(
@@ -2222,12 +2746,12 @@ export class SheetView extends TextFileView {
 	private showMenu(anchor: HTMLElement, entries: MenuEntry[]): void {
 		const menu = new Menu();
 		for (const entry of entries) {
-			menu.addItem((item) =>
-				item
-					.setTitle(entry.title)
+			menu.addItem((item) => {
+				item.setTitle(entry.title)
 					.setIcon(entry.icon)
-					.onClick(entry.onClick),
-			);
+					.onClick(entry.onClick);
+				if (entry.checked !== undefined) item.setChecked(entry.checked);
+			});
 		}
 		const rect = anchor.getBoundingClientRect();
 		menu.showAtPosition({ x: rect.left, y: rect.bottom });
@@ -2282,6 +2806,7 @@ export class SheetView extends TextFileView {
 		this.clearRefPick();
 		const first = this.getSelectedRanges()[0];
 		this.formulaCell = first ? { row: first.r1, col: first.c1 } : null;
+		this.markActiveImageCell();
 
 		if (this.painterSource) {
 			const ranges = this.getSelectedRanges();
@@ -2326,8 +2851,10 @@ export class SheetView extends TextFileView {
 	private applyFormat(
 		ranges: SelRange[],
 		mutate: (f: CellFormat, r: number, c: number, range: SelRange) => void,
+		coalesce = '',
 	): void {
 		if (ranges.length === 0 || !this.hot) return;
+		// Stored formats are replaced, never changed in place: undo steps keep the old objects.
 		for (const rg of ranges) {
 			for (let r = rg.r1; r <= rg.r2; r++) {
 				for (let c = rg.c1; c <= rg.c2; c++) {
@@ -2347,8 +2874,653 @@ export class SheetView extends TextFileView {
 			for (let c = rg.c1; c <= rg.c2; c++) cols.add(c);
 		this.fitExpandColumns(cols);
 		this.hot.render();
+		// A color picker reports every color the pointer passes over: keep one drag one undo step.
+		if (coalesce)
+			this.coalesce = {
+				tag: `${coalesce}:${JSON.stringify(ranges)}`,
+				windowMs: 1500,
+			};
 		this.markDirty();
 		this.refreshToolbarState();
+	}
+
+	/* ---------------- Undo ---------------- */
+
+	private undoPlugin(): UndoRedoPlugin | null {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return null;
+		return hot.getPlugin('undoRedo');
+	}
+
+	private captureSideState(): SideState {
+		const m = this.model;
+		return {
+			formats: { ...m.cellFormats },
+			images: { ...m.images },
+			imageSizes: { ...m.imageSizes },
+			widenRecords: JSON.stringify(m.widenRecords ?? {}),
+			colWidths: m.colWidths.slice(),
+			rowHeights: m.rowHeights.slice(),
+		};
+	}
+
+	/** Forgets what the side state was compared with (after a load or an undo). */
+	private resetSideBaseline(): void {
+		this.sideBaseline = this.captureSideState();
+	}
+
+	/** Checks for side-state changes once the current action has finished (see markDirty). */
+	private queueSideCheck(): void {
+		if (this.sideCheckQueued) return;
+		this.sideCheckQueued = true;
+		queueMicrotask(() => {
+			this.sideCheckQueued = false;
+			try {
+				this.recordSideChanges();
+			} catch (e) {
+				console.error('[Free-Excel] Could not record an undo step', e);
+			}
+		});
+	}
+
+	/**
+	 * Makes whatever just changed outside the cell values undoable. Handsontable only undoes
+	 * values, merges and inserted or removed rows and columns; formats, images and sizes are
+	 * compared with how they were after the previous action. A difference is attached to the
+	 * steps Handsontable recorded for the same action, or becomes a step of its own, so one
+	 * Ctrl+Z takes back the whole action (like Google Sheets).
+	 */
+	private recordSideChanges(): void {
+		const plugin = this.undoPlugin();
+		const coalesce = this.coalesce;
+		this.coalesce = null;
+		if (!plugin || this.sideBusy) return;
+		const baseline = this.sideBaseline;
+		const current = this.captureSideState();
+		this.sideBaseline = current;
+
+		// The steps on top of the stack that were added since the last check.
+		const done = plugin.doneActions as UndoStep[];
+		let firstNew = done.length;
+		while (firstNew > 0) {
+			const action = done[firstNew - 1];
+			if (!action || this.knownSteps.has(action)) break;
+			firstNew--;
+		}
+		const fresh = done.slice(firstNew);
+		for (const action of fresh) this.knownSteps.add(action);
+		if (
+			plugin.ignoreNewActions || // an undo or redo is still running
+			!baseline ||
+			sameSideState(baseline, current)
+		)
+			return;
+
+		const now = Date.now();
+		const last = this.lastSideStep;
+		if (
+			fresh.length === 0 &&
+			coalesce &&
+			last &&
+			last.tag === coalesce.tag &&
+			now - last.time < coalesce.windowMs &&
+			done[done.length - 1] === last.step
+		) {
+			last.state.after = current;
+			last.time = now;
+			return;
+		}
+
+		const state = { before: baseline, after: current };
+		const step = this.sideStep(fresh, state);
+		this.knownSteps.add(step);
+		if (fresh.length > 0) done.splice(firstNew, fresh.length, step);
+		else plugin.done(() => step);
+		this.lastSideStep = coalesce
+			? { step, tag: coalesce.tag, time: now, state }
+			: null;
+	}
+
+	/** An undo step that runs Handsontable's own steps and then puts the side state back. */
+	private sideStep(
+		inner: UndoStep[],
+		state: { before: SideState; after: SideState },
+	): UndoStep {
+		const run = (
+			hot: Handsontable.Core,
+			steps: UndoStep[],
+			method: 'undo' | 'redo',
+			target: () => SideState,
+			done: () => void,
+		): void => {
+			this.sideBusy = true;
+			let i = 0;
+			const finish = (): void => {
+				try {
+					this.restoreSideState(target());
+				} catch (e) {
+					this.plugin.reportError('Could not undo or redo', e);
+				} finally {
+					this.sideBusy = false;
+					this.resetSideBaseline();
+					done();
+				}
+			};
+			// Handsontable reports a finished step from inside its render: continue after it.
+			const next = (): void => {
+				const action = steps[i++];
+				if (!action) {
+					finish();
+					return;
+				}
+				try {
+					action[method](hot, () => queueMicrotask(next));
+				} catch (e) {
+					console.error('[Free-Excel] Undo step failed', e);
+					finish();
+				}
+			};
+			next();
+		};
+		// Handsontable deep-clones a step for its hooks: keep the state in the closures.
+		return {
+			actionType: 'sheet_change',
+			undo: (hot, done) =>
+				run(
+					hot,
+					inner.slice().reverse(),
+					'undo',
+					() => state.before,
+					done,
+				),
+			redo: (hot, done) =>
+				run(hot, inner, 'redo', () => state.after, done),
+		};
+	}
+
+	private restoreSideState(state: SideState): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const m = this.model;
+		m.cellFormats = { ...state.formats };
+		m.images = { ...state.images };
+		m.imageSizes = { ...state.imageSizes };
+		m.widenRecords = JSON.parse(state.widenRecords) as NonNullable<
+			SheetModel['widenRecords']
+		>;
+		// Every size is applied again: Handsontable moved its own sizes while undoing.
+		const cols = hot.countCols();
+		m.colWidths = state.colWidths.slice(0, cols);
+		for (let c = 0; c < cols; c++) {
+			const w = state.colWidths[c];
+			if (w) this.setColumnWidth(c, w);
+			else this.clearColumnWidth(c);
+		}
+		const rows = hot.countRows();
+		m.rowHeights = state.rowHeights.slice(0, rows);
+		for (let r = 0; r < rows; r++) {
+			const h = state.rowHeights[r];
+			if (h) this.setRowHeight(r, h);
+			else this.clearRowHeight(r);
+		}
+		this.invalidateRowSizes();
+		hot.render();
+		this.markDirty();
+		this.refreshToolbarState();
+	}
+
+	/**
+	 * Ctrl+F opens the find bar. Ctrl+Z and Ctrl+Y keep working after the grid lost the
+	 * keyboard (to a color picker or a menu); while the grid has it, Handsontable handles them.
+	 * Keys are matched by their position, so this works in every keyboard layout.
+	 */
+	private onViewKeyDown(e: KeyboardEvent): void {
+		const mod = Platform.isMacOS ? e.metaKey : e.ctrlKey;
+		if (!mod || e.altKey) return;
+		if (this.app.workspace.getActiveViewOfType(SheetView) !== this) return;
+		const target = e.target instanceof HTMLElement ? e.target : null;
+		if (target?.closest('.modal-container, .menu, .suggestion-container'))
+			return;
+
+		if (e.code === 'KeyF' && !e.shiftKey) {
+			e.preventDefault();
+			this.openFind();
+			return;
+		}
+		const undo = e.code === 'KeyZ' && !e.shiftKey;
+		const redo = e.code === 'KeyY' || (e.code === 'KeyZ' && e.shiftKey);
+		if (!undo && !redo) return;
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed || hot.isListening()) return;
+		if (target && isTextEntry(target)) return;
+		e.preventDefault();
+		this.undoRedo(undo ? 'undo' : 'redo');
+	}
+
+	/* ---------------- Sort, filter, find ---------------- */
+
+	/** The text a cell shows: the result of a formula, not its source. */
+	private cellText(hot: Handsontable.Core, row: number, col: number): string {
+		const display = this.resolveRaw(
+			hot.getSourceDataAtCell(row, col),
+			0,
+			false,
+			{ row, col },
+		);
+		if (display === null) return '';
+		if (typeof display === 'boolean') return display ? 'TRUE' : 'FALSE';
+		return String(display);
+	}
+
+	/** The last row that holds a value or an image, or -1 for an empty sheet. */
+	private lastDataRow(hot: Handsontable.Core): number {
+		let last = -1;
+		for (const k of Object.keys(this.model.images))
+			last = Math.max(last, Number(k.split(',')[0] ?? -1));
+		for (let r = hot.countRows() - 1; r > last; r--) {
+			const row = hot.getSourceDataAtRow(r) as unknown[];
+			if (row.some((v) => v !== null && v !== undefined && v !== ''))
+				return r;
+		}
+		return last;
+	}
+
+	private activeColumnName(): string {
+		const cell = this.formulaCell;
+		return cell
+			? `column ${indexToColumnLabel(cell.col)}`
+			: 'the selected column';
+	}
+
+	private headerRowEntry(): MenuEntry {
+		return {
+			title: 'First row is a header',
+			icon: 'heading',
+			checked: this.hasHeaderRow,
+			onClick: () => {
+				this.hasHeaderRow = !this.hasHeaderRow;
+				if (this.filters.size > 0) this.applyFilters();
+			},
+		};
+	}
+
+	/**
+	 * Sorts whole rows by the column of the active cell: the selected rows when several are
+	 * selected, otherwise every row down to the last one with data. Rows hidden by a filter
+	 * stay where they are.
+	 */
+	private sortByColumn(descending: boolean): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const cell = this.formulaCell;
+		if (!cell) {
+			new Notice('Select a cell in the column to sort by first.');
+			return;
+		}
+		const selected = this.getSelectedRanges()[0];
+		const span = selected && selected.r2 > selected.r1 ? selected : null;
+		const first = Math.max(span?.r1 ?? 0, this.hasHeaderRow ? 1 : 0);
+		const last = Math.min(
+			span?.r2 ?? Number.MAX_SAFE_INTEGER,
+			this.lastDataRow(hot),
+		);
+
+		const hidden = hot.getPlugin('hiddenRows');
+		const rows: number[] = [];
+		for (let r = first; r <= last; r++)
+			if (!hidden.isHidden(r)) rows.push(r);
+		if (rows.length < 2) {
+			new Notice('There is nothing to sort.');
+			return;
+		}
+		if (
+			this.liveMerges(hot).some(
+				(m) => m.row <= last && m.row + m.rowspan - 1 >= first,
+			)
+		) {
+			new Notice('Unmerge the cells in the rows to sort first.');
+			return;
+		}
+
+		const keys = rows.map((r) =>
+			this.resolveRaw(hot.getSourceDataAtCell(r, cell.col), 0, true, {
+				row: r,
+				col: cell.col,
+			}),
+		);
+		const order = rows
+			.map((_r, i) => i)
+			.sort((a, b) =>
+				compareForSort(keys[a] ?? null, keys[b] ?? null, descending),
+			);
+		if (!order.every((from, i) => from === i)) {
+			this.writeRows(
+				this.reorderRows(this.snapshotRows(hot, rows), order),
+			);
+		}
+		hot.listen();
+	}
+
+	private snapshotRows(hot: Handsontable.Core, rows: number[]): RowsSnapshot {
+		const wanted = new Set(rows);
+		const pick = <T>(source: Record<string, T>): Record<string, T> => {
+			const out: Record<string, T> = {};
+			for (const [k, value] of Object.entries(source))
+				if (wanted.has(Number(k.split(',')[0]))) out[k] = value;
+			return out;
+		};
+		return {
+			rows,
+			data: rows.map((r) =>
+				(hot.getSourceDataAtRow(r) as Scalar[]).slice(),
+			),
+			formats: pick(this.model.cellFormats),
+			images: pick(this.model.images),
+			imageSizes: pick(this.model.imageSizes),
+			heights: rows.map((r) => this.model.rowHeights[r] ?? null),
+		};
+	}
+
+	/** The snapshot's rows in a new order: position `i` receives the row that was at `order[i]`. */
+	private reorderRows(snap: RowsSnapshot, order: number[]): RowsSnapshot {
+		const target = new Map<number, number>(); // row before -> row after
+		order.forEach((from, i) => {
+			const source = snap.rows[from];
+			const dest = snap.rows[i];
+			if (source !== undefined && dest !== undefined)
+				target.set(source, dest);
+		});
+		const move = <T>(source: Record<string, T>): Record<string, T> => {
+			const out: Record<string, T> = {};
+			for (const [k, value] of Object.entries(source)) {
+				const parts = k.split(',').map(Number);
+				const r = parts[0] ?? 0;
+				out[key(target.get(r) ?? r, parts[1] ?? 0)] = value;
+			}
+			return out;
+		};
+		const formulas = this.plugin.settings.enableFormulas;
+		return {
+			rows: snap.rows,
+			data: order.map((from, i) => {
+				const delta = (snap.rows[i] ?? 0) - (snap.rows[from] ?? 0);
+				return (snap.data[from] ?? []).map((v) =>
+					formulas && typeof v === 'string'
+						? shiftFormulaRows(v, delta)
+						: v,
+				);
+			}),
+			formats: move(snap.formats),
+			images: move(snap.images),
+			imageSizes: move(snap.imageSizes),
+			heights: order.map((from) => snap.heights[from] ?? null),
+		};
+	}
+
+	/** Writes a snapshot into the sheet: values, formats, images and heights of its rows. */
+	private writeRows(snap: RowsSnapshot): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const wanted = new Set(snap.rows);
+		const replace = <T>(
+			live: Record<string, T>,
+			saved: Record<string, T>,
+		): void => {
+			for (const k of Object.keys(live))
+				if (wanted.has(Number(k.split(',')[0]))) delete live[k];
+			Object.assign(live, saved);
+		};
+		replace(this.model.cellFormats, snap.formats);
+		replace(this.model.images, snap.images);
+		replace(this.model.imageSizes, snap.imageSizes);
+
+		const changes: [number, number, Scalar][] = [];
+		snap.rows.forEach((r, i) => {
+			const h = snap.heights[i] ?? null;
+			if ((this.model.rowHeights[r] ?? null) !== h) {
+				if (h) this.setRowHeight(r, h);
+				else this.clearRowHeight(r);
+			}
+			(snap.data[i] ?? []).forEach((value, c) => {
+				const current: unknown = hot.getSourceDataAtCell(r, c);
+				if ((current ?? null) !== value) changes.push([r, c, value]);
+			});
+		});
+		// Handsontable records the values; the formats and sizes join that undo step (markDirty).
+		if (changes.length > 0) hot.setDataAtCell(changes, 'sort');
+		this.invalidateRowSizes();
+		hot.render();
+		this.markDirty();
+		this.refreshToolbarState();
+	}
+
+	private openColumnFilter(): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const cell = this.formulaCell;
+		if (!cell) {
+			new Notice('Select a cell in the column to filter first.');
+			return;
+		}
+		const col = cell.col;
+		const first = this.hasHeaderRow ? 1 : 0;
+		const last = this.lastDataRow(hot);
+		if (last < first) {
+			new Notice('There is no data to filter.');
+			return;
+		}
+		const values = new Set<string>();
+		for (let r = first; r <= last; r++)
+			values.add(this.cellText(hot, r, col));
+		const header = this.hasHeaderRow ? this.cellText(hot, 0, col) : '';
+		new ColumnFilterModal(
+			this.app,
+			`Filter column ${indexToColumnLabel(col)}${header ? ` (${header})` : ''}`,
+			[...values].sort(compareText),
+			this.filters.get(col) ?? null,
+			(filter) => this.setColumnFilter(col, filter),
+		).open();
+	}
+
+	private setColumnFilter(col: number, filter: ColumnFilter | null): void {
+		if (filter) this.filters.set(col, filter);
+		else this.filters.delete(col);
+		this.applyFilters();
+		if (this.hot && !this.hot.isDestroyed) this.hot.listen();
+	}
+
+	/** Hides the rows that do not pass every column filter. Rows below the data stay visible. */
+	private applyFilters(): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const hide: number[] = [];
+		if (this.filters.size > 0) {
+			const last = this.lastDataRow(hot);
+			for (let r = this.hasHeaderRow ? 1 : 0; r <= last; r++) {
+				for (const [col, filter] of this.filters) {
+					if (filterAccepts(filter, this.cellText(hot, r, col)))
+						continue;
+					hide.push(r);
+					break;
+				}
+			}
+		}
+		const plugin = hot.getPlugin('hiddenRows');
+		plugin.showRows(plugin.getHiddenRows());
+		plugin.hideRows(hide);
+		this.findStale = true;
+		hot.render();
+		this.ui.filterBtn?.toggleClass('is-active', this.filters.size > 0);
+	}
+
+	/** Keeps each filter on its column when columns are inserted or removed. */
+	private remapFilters(
+		index: number,
+		amount: number,
+		mode: 'insert' | 'remove',
+	): void {
+		if (this.filters.size === 0) return;
+		const next = new Map<number, ColumnFilter>();
+		let removed = false;
+		for (const [col, filter] of this.filters) {
+			if (mode === 'insert')
+				next.set(col >= index ? col + amount : col, filter);
+			else if (col < index) next.set(col, filter);
+			else if (col >= index + amount) next.set(col - amount, filter);
+			else removed = true;
+		}
+		this.filters = next;
+		// The filtered column is gone: show its rows again, once Handsontable is done altering.
+		if (removed) window.setTimeout(() => this.applyFilters());
+	}
+
+	private buildFindBar(): void {
+		const bar = this.findBarEl;
+		bar.empty();
+		bar.hide();
+		const input = bar.createEl('input', {
+			type: 'text',
+			cls: 'rtl-sheet-find-input',
+			attr: {
+				placeholder: 'Find in sheet',
+				dir: 'auto',
+				spellcheck: 'false',
+				autocomplete: 'off',
+			},
+		});
+		this.ui.findInput = input;
+		this.ui.findCount = bar.createSpan({ cls: 'rtl-sheet-find-count' });
+		this.addButton(bar, 'chevron-up', 'Previous', 'Previous match', () =>
+			this.stepFind(-1),
+		);
+		this.addButton(bar, 'chevron-down', 'Next', 'Next match', () =>
+			this.stepFind(1),
+		);
+		this.addButton(bar, 'x', 'Close', 'Close', () => this.closeFind());
+
+		// Like the formula bar: typing here must not reach the grid.
+		input.addEventListener('focus', () => this.hot?.unlisten());
+		input.addEventListener('input', () => {
+			this.runFind();
+			this.showMatch(0);
+		});
+		input.addEventListener('keydown', (e) => {
+			if (e.key === 'Enter') {
+				e.preventDefault();
+				this.stepFind(e.shiftKey ? -1 : 1);
+			} else if (e.key === 'Escape') {
+				e.preventDefault();
+				e.stopPropagation();
+				this.closeFind();
+			}
+		});
+	}
+
+	private openFind(): void {
+		const input = this.ui.findInput;
+		if (!input) return;
+		const wasShown = this.findBarEl.isShown();
+		this.findBarEl.show();
+		if (!wasShown) this.onResize();
+		input.focus();
+		input.select();
+		if (!wasShown && input.value) {
+			this.runFind();
+			this.showMatch(0);
+		}
+	}
+
+	/** Closes the find bar and leaves the selection on the match that was shown. */
+	private closeFind(): void {
+		const match = this.findMatches[this.findIndex];
+		this.findBarEl.hide();
+		this.findMatches = [];
+		this.findHits.clear();
+		this.findIndex = -1;
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		hot.render();
+		this.onResize();
+		if (match) hot.selectCell(match.row, match.col);
+		hot.listen();
+	}
+
+	/** Collects the cells whose shown text contains the search text (case-insensitive). */
+	private runFind(): void {
+		const hot = this.hot;
+		const query = (this.ui.findInput?.value ?? '').toLowerCase();
+		this.findMatches = [];
+		this.findHits.clear();
+		this.findIndex = -1;
+		this.findStale = false;
+		if (!hot || hot.isDestroyed) return;
+		if (query) {
+			const hidden = hot.getPlugin('hiddenRows');
+			const rows = hot.countRows();
+			const cols = hot.countCols();
+			for (let r = 0; r < rows; r++) {
+				if (hidden.isHidden(r)) continue;
+				for (let c = 0; c < cols; c++) {
+					const raw: unknown = hot.getSourceDataAtCell(r, c);
+					if (raw === null || raw === undefined || raw === '')
+						continue;
+					if (!this.cellText(hot, r, c).toLowerCase().includes(query))
+						continue;
+					this.findMatches.push({ row: r, col: c });
+					this.findHits.add(key(r, c));
+				}
+			}
+		}
+		hot.render();
+		this.updateFindCount();
+	}
+
+	private stepFind(delta: number): void {
+		const current = this.findMatches[this.findIndex];
+		if (this.findStale) {
+			this.runFind();
+			// Continue from the match that was shown, if it still matches.
+			if (current)
+				this.findIndex = this.findMatches.findIndex(
+					(m) => m.row === current.row && m.col === current.col,
+				);
+		}
+		const count = this.findMatches.length;
+		if (count === 0) return;
+		const next =
+			this.findIndex < 0
+				? delta > 0
+					? 0
+					: count - 1
+				: (this.findIndex + delta + count) % count;
+		this.showMatch(next);
+	}
+
+	/**
+	 * Marks a match as the current one and scrolls to it. The cell is not selected while the
+	 * find bar is in use: selecting would move the keyboard focus into the grid.
+	 */
+	private showMatch(index: number): void {
+		const hot = this.hot;
+		const match = this.findMatches[index];
+		this.findIndex = match ? index : -1;
+		if (hot && !hot.isDestroyed && match) {
+			hot.scrollViewportTo({ row: match.row, col: match.col });
+			hot.render();
+		}
+		this.updateFindCount();
+	}
+
+	private updateFindCount(): void {
+		const count = this.findMatches.length;
+		const hasQuery = !!this.ui.findInput?.value;
+		this.ui.findCount?.setText(
+			!hasQuery
+				? ''
+				: count === 0
+					? 'No results'
+					: `${this.findIndex + 1} / ${count}`,
+		);
 	}
 
 	private toggleFlag(flag: 'bold' | 'italic' | 'underline' | 'strike'): void {
@@ -2521,12 +3693,8 @@ export class SheetView extends TextFileView {
 	}
 
 	private undoRedo(action: 'undo' | 'redo'): void {
-		const hot = this.hot;
-		if (!hot || hot.isDestroyed) return;
-		const plugin = hot.getPlugin('undoRedo') as unknown as {
-			undo(): void;
-			redo(): void;
-		};
+		const plugin = this.undoPlugin();
+		if (!plugin) return;
 		if (action === 'undo') plugin.undo();
 		else plugin.redo();
 	}
@@ -2560,10 +3728,32 @@ export class SheetView extends TextFileView {
 	}
 
 	private toggleDirection(): void {
+		this.setDirection(!this.model.rtl);
+	}
+
+	/** Changes the sheet direction (which rebuilds the grid) as an undoable step. */
+	private setDirection(rtl: boolean, record = true): void {
+		if (rtl === this.model.rtl) return;
 		this.captureGridStateIfLive();
-		this.model.rtl = !this.model.rtl;
-		this.rebuildGrid();
+		this.model.rtl = rtl;
+		this.rebuildGrid(true);
 		this.markDirty();
+		const plugin = this.undoPlugin();
+		if (!record || !plugin) return;
+		// The grid cannot be rebuilt while Handsontable is still running the undo: do it right after.
+		const later =
+			(value: boolean): UndoStep['undo'] =>
+			(_hot, done) => {
+				done();
+				window.setTimeout(() => this.setDirection(value, false));
+			};
+		const step: UndoStep = {
+			actionType: 'sheet_direction',
+			undo: later(!rtl),
+			redo: later(rtl),
+		};
+		this.knownSteps.add(step);
+		plugin.done(() => step);
 	}
 
 	/* ---------------- Zoom ---------------- */
@@ -2856,16 +4046,20 @@ export class SheetView extends TextFileView {
 			return;
 		}
 		const k = key(cell.row, cell.col);
+		// The cell is resized once the image has loaded: that belongs to the same undo step.
+		const coalesce = { tag: `image:${k}:${Date.now()}`, windowMs: 30000 };
 		this.model.images[k] = path;
 		hot.render();
 		hot.selectCell(cell.row, cell.col);
 		hot.listen();
+		this.coalesce = coalesce;
 		this.markDirty();
 
 		await this.fitCellToImage(cell.row, cell.col, path);
 		if (this.model.images[k] !== path || hot.isDestroyed) return; // removed in the meantime
 		this.invalidateRowSizes();
 		hot.render();
+		this.coalesce = coalesce;
 		this.markDirty();
 	}
 
@@ -3083,14 +4277,7 @@ export class SheetView extends TextFileView {
 
 			const choice = await this.askImportDirection(imported.rtl);
 			if (choice === null) return; // dialog dismissed: cancel the import
-			if (choice !== 'keep') {
-				const wantRtl = choice === 'rtl';
-				if (wantRtl !== this.model.rtl) {
-					this.captureGridStateIfLive();
-					this.model.rtl = wantRtl;
-					this.rebuildGrid();
-				}
-			}
+			if (choice !== 'keep') this.setDirection(choice === 'rtl');
 			this.applyImported(imported);
 		} catch (e) {
 			this.plugin.reportError('Import failed', e);

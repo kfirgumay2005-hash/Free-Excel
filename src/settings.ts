@@ -14,7 +14,13 @@ export interface PluginSettings {
 	/** Toolbar size in percent, on desktop and on mobile (phones and tablets). */
 	toolbarScaleDesktop: number;
 	toolbarScaleMobile: number;
+	/** Colors saved in the toolbar for one-click use, as "#rrggbb" (managed from the toolbar). */
+	savedFillColors: string[];
+	savedTextColors: string[];
 }
+
+/** How many colors can be saved for the fill, and how many for the text. */
+export const MAX_SAVED_COLORS = 10;
 
 export const DEFAULT_SETTINGS: PluginSettings = {
 	autosave: true,
@@ -27,7 +33,18 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	enableFormulas: true,
 	toolbarScaleDesktop: 100,
 	toolbarScaleMobile: 100,
+	savedFillColors: [],
+	savedTextColors: [],
 };
+
+function toColors(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const colors = value
+		.filter((v): v is string => typeof v === 'string')
+		.map((v) => v.toLowerCase())
+		.filter((v) => /^#[0-9a-f]{6}$/.test(v));
+	return [...new Set(colors)].slice(0, MAX_SAVED_COLORS);
+}
 
 function toInt(
 	value: unknown,
@@ -91,6 +108,8 @@ export function sanitizeSettings(
 			50,
 			150,
 		),
+		savedFillColors: toColors(s.savedFillColors),
+		savedTextColors: toColors(s.savedTextColors),
 	};
 }
 

@@ -27,6 +27,8 @@ Excel-style spreadsheet for Obsidian with full RTL support, built on Handsontabl
 - `tsconfig` uses `strict` and `noUncheckedIndexedAccess`: every `arr[i]` may be `undefined`, so guard it or give it a default.
 - The model stores sizes at 100% zoom. Zoom is view-only and is applied when sizes are handed to Handsontable.
 - Per-cell data is keyed `"row,col"`. When rows or columns are inserted or removed, remap every keyed map (`cellFormats`, `images`, `imageSizes`, `widenRecords`) in `remapCellMaps`.
+- Visual and physical row/column indexes must stay equal: filters hide rows with the `hiddenRows` plugin (view-only, not saved), and sorting rewrites the rows themselves (`sortByColumn`). Never enable Handsontable's `filters`, `columnSorting` or trimming plugins.
+- Undo: Handsontable undoes cell values, merges and inserted or removed rows and columns. Everything else in the model (`SideState`: formats, images, sizes) is recorded by `recordSideChanges`, which runs after every `markDirty()` and attaches the difference to the same undo step. So call `markDirty()` after every model change, and replace format and image-size objects instead of changing them in place (they are compared by identity).
 - Row heights come from the font size (`computeRowHeight`), not from Handsontable auto-sizing. Column widths are never automatic.
 - Handsontable cell renderers reuse `<td>` elements: reset every style you set, and remove any child elements you added.
 - Handsontable v16+: styles are imported from `handsontable/styles/...`, the theme is set with `themeName`, and `layoutDirection` can only be set at creation (a direction change rebuilds the grid).
