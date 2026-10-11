@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-sample-plugin",
+	"name": "free-excel",
 	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"description": "Actually Excel in obsidian frfr thank me later or prob never but i still love yall xoxo.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
@@ -18,9 +18,12 @@
 		"esbuild": "0.25.5",
 		"eslint": "^9.39.4",
 		"eslint-plugin-obsidianmd": "^0.4.0",
+		"exceljs": "^4.4.0",
+		"fast-formula-parser": "^1.0.19",
 		"globals": "^17.6.0",
+		"handsontable": "^18.1.2",
 		"jiti": "^2.6.1",
-		"obsidian": "latest",
+		"obsidian": "^1.14.4",
 		"typescript": "^5.8.3",
 		"typescript-eslint": "^8.59.1"
 	}

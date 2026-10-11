@@ -1,114 +1,3023 @@
 import {
-	Editor,
-	MarkdownView,
-	MarkdownFileInfo,
-	Modal,
+	debounce,
+	Menu,
 	Notice,
+	Platform,
 	Plugin,
+	TFile,
+	TextFileView,
+	WorkspaceLeaf,
+	normalizePath,
+	setIcon,
 } from 'obsidian';
+import Handsontable from 'handsontable';
+import 'handsontable/styles/handsontable.min.css';
+import 'handsontable/styles/ht-theme-main.min.css';
+import './plugin.css';
+import ExcelJS from 'exceljs';
 import {
 	DEFAULT_SETTINGS,
-	MyPluginSettings,
-	SampleSettingTab,
+	PluginSettings,
+	SettingsTab,
+	sanitizeSettings,
 } from './settings';
+import {
+	CellBorders,
+	CellFormat,
+	DEFAULT_COL_WIDTH,
+	FONT_SIZES,
+	NUMERIC_RE,
+	ROTATIONS,
+	Scalar,
+	SelRange,
+	SheetModel,
+	cloneFormat,
+	MAX_ZOOM,
+	MIN_ZOOM,
+	ROW_LINE_HEIGHT,
+	ROW_VERTICAL_PADDING,
+	createDefaultModel,
+	defaultSheetRtl,
+	indexToColumnLabel,
+	isEmptyFormat,
+	key,
+	rowBaseHeight,
+	serializeModel,
+} from './model';
+import {
+	FormulaFunctionInfo,
+	buildFunctionCall,
+	evaluateFormula,
+	normalizeSeparators,
+} from './formulas';
+import { ImportedSheet, parseCsv, parseXlsx } from './xlsx';
+import {
+	FormulaAutocomplete,
+	FunctionPickerModal,
+	ImportDirectionChoice,
+	ImportDirectionModal,
+	VaultFilePickerModal,
+} from './ui';
 
-// Remember to rename these classes and interfaces!
+/* ------------------------------------------------------------------ */
+/* Constants                                                           */
+/* ------------------------------------------------------------------ */
 
-export default class MyPlugin extends Plugin {
-	settings!: MyPluginSettings;
+const VIEW_TYPE = 'rtl-spreadsheet-view';
+const SHEET_EXT = 'sheet';
+/** Used automatically when another plugin already owns the .sheet extension. */
+const FALLBACK_SHEET_EXT = 'rtlsheet';
+const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'];
+const MAX_IMAGE_CELL_PX = 240;
+/** Extra px added to measured text when a column is widened to fit it. */
+const EXPAND_PADDING = 18;
+const MAX_EXPAND_WIDTH = 600;
+/** Horizontal padding inside a cell, used when measuring text. */
+const CELL_PADDING = 8;
 
-	async onload() {
-		await this.loadSettings();
+type BorderMode =
+	| 'all'
+	| 'outer'
+	| 'top'
+	| 'bottom'
+	| 'left'
+	| 'right'
+	| 'none';
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (_evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
+/** True on Obsidian mobile and on any device whose primary pointer is touch. */
+const IS_TOUCH: boolean =
+	Platform.isMobile ||
+	(typeof window !== 'undefined' &&
+		window.matchMedia('(pointer: coarse)').matches);
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
+/** Handsontable theme that follows the active Obsidian theme (light/dark). */
+function handsontableThemeName(): string {
+	return document.body.classList.contains('theme-dark')
+		? 'ht-theme-main-dark'
+		: 'ht-theme-main';
+}
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			},
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (
-				editor: Editor,
-				_ctx: MarkdownView | MarkdownFileInfo,
-			) => {
-				editor.replaceSelection('Sample editor command');
-			},
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView =
-					this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+function toArgb(hex: string): string {
+	let h = hex.replace('#', '');
+	if (h.length === 3)
+		h = h
+			.split('')
+			.map((ch) => ch + ch)
+			.join('');
+	return `FF${h.toUpperCase()}`;
+}
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			},
-		});
+function sanitizeSheetName(name: string): string {
+	const cleaned = name.replace(/[\\/?*[\]:]/g, ' ').trim();
+	return (cleaned || 'Sheet1').slice(0, 31);
+}
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(activeDocument, 'click', (_evt: MouseEvent) => {
-			new Notice('Click');
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(
-			window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000),
-		);
+/** Draws cell borders as background layers (reliable inside Handsontable's table cells). */
+function applyBorderStyles(st: CSSStyleDeclaration, b?: CellBorders): void {
+	const color = b?.color ?? 'var(--text-normal)';
+	const layer = `linear-gradient(${color}, ${color})`;
+	const images: string[] = [];
+	const sizes: string[] = [];
+	const positions: string[] = [];
+	if (b?.top) {
+		images.push(layer);
+		sizes.push('100% 1px');
+		positions.push('0 0');
 	}
-
-	onunload() {}
-
-	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<MyPluginSettings>,
-		);
+	if (b?.right) {
+		images.push(layer);
+		sizes.push('1px 100%');
+		positions.push('100% 0');
 	}
+	if (b?.bottom) {
+		images.push(layer);
+		sizes.push('100% 1px');
+		positions.push('0 100%');
+	}
+	if (b?.left) {
+		images.push(layer);
+		sizes.push('1px 100%');
+		positions.push('0 0');
+	}
+	st.backgroundImage = images.join(', ');
+	st.backgroundSize = sizes.join(', ');
+	st.backgroundPosition = positions.join(', ');
+	st.backgroundRepeat = images.length > 0 ? 'no-repeat' : '';
+}
 
-	async saveSettings() {
-		await this.saveData(this.settings);
+/** Our rotation values (+up / -down) to Excel's textRotation (0-90 up, 91-180 down). */
+function rotationToExcel(rotate: number | undefined): number | undefined {
+	if (!rotate) return undefined;
+	if (rotate > 0) return rotate;
+	return 90 + Math.abs(rotate);
+}
+
+function decodeText(data: ArrayBuffer): string {
+	try {
+		return new TextDecoder('utf-8', { fatal: true }).decode(data);
+	} catch {
+		// Excel on Windows often saves Hebrew CSV files as Windows-1255.
+		try {
+			return new TextDecoder('windows-1255').decode(data);
+		} catch {
+			return new TextDecoder().decode(data);
+		}
 	}
 }
 
-class SampleModal extends Modal {
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.setText('Woah!');
+/* ------------------------------------------------------------------ */
+/* Plugin                                                              */
+/* ------------------------------------------------------------------ */
+
+export default class RtlSpreadsheetPlugin extends Plugin {
+	settings: PluginSettings = { ...DEFAULT_SETTINGS };
+	/** The file extension actually registered for spreadsheet files. */
+	sheetExt: string = SHEET_EXT;
+
+	async onload(): Promise<void> {
+		await this.loadSettings();
+
+		this.registerView(VIEW_TYPE, (leaf) => new SheetView(leaf, this));
+		this.registerSheetExtension();
+
+		this.addRibbonIcon('table', 'New spreadsheet', () => {
+			void this.createNewSheet();
+		});
+
+		this.addCommand({
+			id: 'create-new-sheet',
+			name: 'Create new spreadsheet',
+			callback: () => {
+				void this.createNewSheet();
+			},
+		});
+
+		this.addCommand({
+			id: 'save-active-sheet',
+			name: 'Save active spreadsheet',
+			checkCallback: (checking) => {
+				const view = this.app.workspace.getActiveViewOfType(SheetView);
+				if (!view) return false;
+				if (!checking) void view.saveNow();
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: 'export-active-sheet-xlsx',
+			name: 'Export active spreadsheet to Excel (.xlsx)',
+			checkCallback: (checking) => {
+				const view = this.app.workspace.getActiveViewOfType(SheetView);
+				if (!view) return false;
+				if (!checking) void view.exportToXlsx();
+				return true;
+			},
+		});
+
+		this.addSettingTab(new SettingsTab(this.app, this));
 	}
 
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
+	/**
+	 * registerExtensions throws if the extension is already owned by another
+	 * plugin (or by Obsidian). In that case fall back to a unique extension
+	 * instead of failing to load the whole plugin.
+	 */
+	private registerSheetExtension(): void {
+		try {
+			this.registerExtensions([SHEET_EXT], VIEW_TYPE);
+			this.sheetExt = SHEET_EXT;
+		} catch (e) {
+			console.warn(
+				`[Free-Excel] ".${SHEET_EXT}" is already registered, using ".${FALLBACK_SHEET_EXT}"`,
+				e,
+			);
+			try {
+				this.registerExtensions([FALLBACK_SHEET_EXT], VIEW_TYPE);
+				this.sheetExt = FALLBACK_SHEET_EXT;
+				new Notice(
+					`Free-Excel: the ".${SHEET_EXT}" extension is used by another plugin. ` +
+						`New spreadsheets will use ".${FALLBACK_SHEET_EXT}" instead.`,
+					10000,
+				);
+			} catch (e2) {
+				this.reportError(
+					'Could not register the spreadsheet file extension',
+					e2,
+				);
+			}
+		}
+	}
+
+	onunload(): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+			if (leaf.view instanceof SheetView) leaf.view.destroyGrid();
+		}
+	}
+
+	async loadSettings(): Promise<void> {
+		const stored =
+			(await this.loadData()) as Partial<PluginSettings> | null;
+		this.settings = sanitizeSettings(stored);
+	}
+
+	async saveSettings(): Promise<void> {
+		this.settings = sanitizeSettings(this.settings);
+		await this.saveData(this.settings);
+		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+			if (leaf.view instanceof SheetView) leaf.view.applySettings();
+		}
+	}
+
+	reportError(message: string, error: unknown): void {
+		console.error(`[Free-Excel] ${message}`, error);
+		const detail = error instanceof Error ? error.message : String(error);
+		new Notice(`${message}: ${detail}`);
+	}
+
+	async createNewSheet(): Promise<void> {
+		try {
+			const active = this.app.workspace.getActiveFile();
+			const folder = this.app.fileManager.getNewFileParent(
+				active?.path ?? '',
+			);
+			let path = normalizePath(
+				`${folder.path}/Untitled sheet.${this.sheetExt}`,
+			);
+			let n = 1;
+			while (this.app.vault.getAbstractFileByPath(path)) {
+				path = normalizePath(
+					`${folder.path}/Untitled sheet ${n++}.${this.sheetExt}`,
+				);
+			}
+			const file = await this.app.vault.create(
+				path,
+				serializeModel(
+					createDefaultModel(this.settings, defaultSheetRtl()),
+				),
+			);
+			await this.app.workspace.getLeaf(true).openFile(file);
+		} catch (e) {
+			this.reportError('Could not create spreadsheet', e);
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* View                                                                */
+/* ------------------------------------------------------------------ */
+
+const baseTextRenderer = Handsontable.renderers.getRenderer('text');
+
+interface ToolbarRefs {
+	toggles: Record<string, HTMLButtonElement>;
+	fontSelect?: HTMLSelectElement;
+	rotateSelect?: HTMLSelectElement;
+	brush?: HTMLButtonElement;
+	address?: HTMLElement;
+	formulaInput?: HTMLInputElement;
+	zoomLabel?: HTMLButtonElement;
+}
+
+interface MenuEntry {
+	title: string;
+	icon: string;
+	onClick: () => void;
+}
+
+export class SheetView extends TextFileView {
+	private plugin: RtlSpreadsheetPlugin;
+	private model: SheetModel;
+	private hot: Handsontable | null = null;
+	/** Grid instance used for formula lookups while Handsontable is still constructing. */
+	private gridForCalc: Handsontable.Core | null = null;
+	private formulaBarEl: HTMLElement;
+	private toolbarEl: HTMLElement;
+	private gridEl: HTMLElement;
+	private loading = false;
+	private dirty = false;
+	private appliedSettings: PluginSettings;
+	/** File content this view last loaded; a different content on disk means an outside change. */
+	private diskData = '';
+	private refreshTimer = 0;
+	private refreshing = false;
+
+	private readonly ui: ToolbarRefs = { toggles: {} };
+	private readonly autocomplete = new FormulaAutocomplete();
+	/** Top-left cell of the current selection (shown in the formula bar). */
+	private formulaCell: { row: number; col: number } | null = null;
+	/** Cell that the formula bar was editing when it received focus. */
+	private formulaEditCell: { row: number; col: number } | null = null;
+	/** Formatting copied by the format painter; null when the painter is off. */
+	private painterSource: CellFormat | null = null;
+
+	/** View zoom (0.5-3). Scales column widths, row heights and fonts; it is not saved in the file. */
+	private zoom = 1;
+	private pinch: { startDistance: number; startZoom: number } | null = null;
+	private pendingZoom = 1;
+	private zoomFrame = 0;
+	/** row -> columns that have a format (rebuilt lazily; used to compute row heights). */
+	private rowIndex: Map<number, number[]> | null = null;
+	private fontFamilyCache: string | null = null;
+	private measureCtx: CanvasRenderingContext2D | null = null;
+
+	constructor(leaf: WorkspaceLeaf, plugin: RtlSpreadsheetPlugin) {
+		super(leaf);
+		this.plugin = plugin;
+		this.model = createDefaultModel(plugin.settings, defaultSheetRtl());
+		this.appliedSettings = { ...plugin.settings };
+
+		this.contentEl.empty();
+		this.contentEl.addClass('rtl-spreadsheet-view');
+		this.contentEl.toggleClass('is-touch', IS_TOUCH);
+
+		this.formulaBarEl = this.contentEl.createDiv({
+			cls: 'rtl-sheet-formula-bar',
+		});
+		this.toolbarEl = this.contentEl.createDiv({ cls: 'rtl-sheet-toolbar' });
+		this.gridEl = this.contentEl.createDiv({ cls: 'rtl-sheet-grid' });
+
+		this.buildFormulaBar();
+		this.buildToolbar();
+		this.installAutosave();
+		this.installRefreshTimer();
+		// Sync plugins that write through the vault are picked up right away, the timer covers the rest.
+		this.registerEvent(
+			this.app.vault.on('modify', (file) => {
+				if (file === this.file && this.plugin.settings.autoRefresh)
+					void this.refreshFromDisk();
+			}),
+		);
+		this.register(() => window.clearInterval(this.refreshTimer));
+
+		// Keep the grid theme in sync with Obsidian's light/dark theme.
+		this.registerEvent(
+			this.app.workspace.on('css-change', () => this.updateTheme()),
+		);
+
+		// Paste (Ctrl+V) or drop an image straight into the grid. Capture phase so that
+		// Handsontable's own paste handling does not also run.
+		this.registerDomEvent(this.gridEl, 'paste', (e) => this.onPaste(e), {
+			capture: true,
+		});
+		this.registerDomEvent(this.gridEl, 'dragover', (e) => {
+			if (this.hasImageFile(e)) e.preventDefault();
+		});
+		this.registerDomEvent(this.gridEl, 'drop', (e) => this.onDrop(e));
+
+		// Pinch to zoom. Touches that start in the grid are not passed on to Obsidian, so
+		// dragging sideways scrolls the columns instead of opening the sidebar.
+		const touchDistance = (e: TouchEvent): number => {
+			const a = e.touches[0];
+			const b = e.touches[1];
+			return a && b
+				? Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY)
+				: 0;
+		};
+		this.registerDomEvent(
+			this.gridEl,
+			'touchstart',
+			(e) => {
+				e.stopPropagation();
+				if (e.touches.length === 2)
+					this.pinch = {
+						startDistance: touchDistance(e),
+						startZoom: this.zoom,
+					};
+			},
+			{ passive: true },
+		);
+		this.registerDomEvent(
+			this.gridEl,
+			'touchmove',
+			(e) => {
+				e.stopPropagation();
+				const pinch = this.pinch;
+				if (
+					!pinch ||
+					e.touches.length !== 2 ||
+					pinch.startDistance <= 0
+				)
+					return;
+				e.preventDefault();
+				this.pendingZoom =
+					(pinch.startZoom * touchDistance(e)) / pinch.startDistance;
+				if (!this.zoomFrame) {
+					this.zoomFrame = window.requestAnimationFrame(() => {
+						this.zoomFrame = 0;
+						this.applyZoom(this.pendingZoom);
+					});
+				}
+			},
+			{ passive: false },
+		);
+		const endTouch = (e: TouchEvent): void => {
+			e.stopPropagation();
+			if (e.touches.length < 2) this.pinch = null;
+		};
+		this.registerDomEvent(this.gridEl, 'touchend', endTouch, {
+			passive: true,
+		});
+		this.registerDomEvent(this.gridEl, 'touchcancel', endTouch, {
+			passive: true,
+		});
+		this.registerDomEvent(
+			this.gridEl,
+			'wheel',
+			(e) => {
+				if (!e.ctrlKey) return;
+				e.preventDefault();
+				this.applyZoom(this.zoom * (e.deltaY < 0 ? 1.1 : 1 / 1.1));
+			},
+			{ passive: false },
+		);
+	}
+
+	private updateTheme(): void {
+		this.fontFamilyCache = null;
+		if (this.hot && !this.hot.isDestroyed) {
+			this.hot.updateSettings({ themeName: handsontableThemeName() });
+		}
+	}
+
+	/* ---------------- TextFileView contract ---------------- */
+
+	getViewType(): string {
+		return VIEW_TYPE;
+	}
+
+	getDisplayText(): string {
+		return this.file?.basename ?? 'Spreadsheet';
+	}
+
+	getIcon(): string {
+		return 'table';
+	}
+
+	getViewData(): string {
+		this.captureGridState();
+		return serializeModel(this.model);
+	}
+
+	setViewData(data: string, clear: boolean): void {
+		this.loading = true;
+		try {
+			let parsed: unknown = null;
+			if (data.trim().length > 0) {
+				try {
+					parsed = JSON.parse(data);
+				} catch (e) {
+					this.plugin.reportError(
+						'Invalid sheet file, opened an empty sheet',
+						e,
+					);
+				}
+			}
+			const next = this.normalizeModel(parsed);
+			this.diskData = data;
+			// Same file, new content: update the live grid so selection and scroll stay put.
+			if (clear || !this.applyModelInPlace(next)) {
+				// Drop the old grid first, rebuildGrid() would copy its stale cells into the new model.
+				this.destroyGrid();
+				this.model = next;
+				this.rebuildGrid();
+			}
+			this.dirty = false;
+		} finally {
+			this.loading = false;
+		}
+	}
+
+	clear(): void {
+		this.destroyGrid();
+		this.model = createDefaultModel(
+			this.plugin.settings,
+			defaultSheetRtl(),
+		);
+		this.dirty = false;
+	}
+
+	async save(clear?: boolean): Promise<void> {
+		await super.save(clear);
+		this.dirty = false;
+	}
+
+	async saveNow(): Promise<void> {
+		try {
+			await this.save();
+			new Notice('Sheet saved');
+		} catch (e) {
+			this.plugin.reportError('Could not save sheet', e);
+		}
+	}
+
+	async onClose(): Promise<void> {
+		try {
+			if (this.dirty && this.file) await this.save();
+		} catch (e) {
+			this.plugin.reportError('Could not save sheet on close', e);
+		}
+		window.clearInterval(this.refreshTimer);
+		this.autocomplete.destroy();
+		this.destroyGrid();
+	}
+
+	onResize(): void {
+		if (this.hot && !this.hot.isDestroyed) this.hot.refreshDimensions();
+	}
+
+	/* ---------------- Settings, autosave ---------------- */
+
+	private installAutosave(): void {
+		// Replace the built-in 2s debounce with one that follows the plugin setting.
+		this.requestSave = debounce(
+			() => {
+				void this.save().catch((e) =>
+					this.plugin.reportError('Autosave failed', e),
+				);
+			},
+			this.plugin.settings.autosaveDelayMs,
+			true,
+		);
+	}
+
+	private installRefreshTimer(): void {
+		window.clearInterval(this.refreshTimer);
+		this.refreshTimer = 0;
+		const s = this.plugin.settings;
+		if (!s.autoRefresh) return;
+		this.refreshTimer = window.setInterval(
+			() => void this.refreshFromDisk(),
+			s.refreshIntervalSec * 1000,
+		);
+	}
+
+	/** True while the user is typing in a cell or in the formula bar. */
+	private isEditing(): boolean {
+		const input = this.ui.formulaInput;
+		if (input && input.ownerDocument.activeElement === input) return true;
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return false;
+		const editor = hot.getActiveEditor() as unknown as
+			| { isOpened?: () => boolean }
+			| undefined;
+		return !!editor?.isOpened?.();
+	}
+
+	/**
+	 * Loads the file again when it was changed outside this view. Waits (until the next
+	 * call) while there are unsaved local changes or the user is typing.
+	 */
+	private async refreshFromDisk(): Promise<void> {
+		const file = this.file;
+		const busy = (): boolean =>
+			this.file !== file ||
+			!this.hot ||
+			this.hot.isDestroyed ||
+			this.loading ||
+			this.dirty ||
+			this.isEditing();
+		if (!file || this.refreshing || busy()) return;
+		if (!this.containerEl.isShown()) return;
+		this.refreshing = true;
+		try {
+			const disk = await this.app.vault.read(file);
+			if (disk === this.diskData || busy()) return;
+			if (disk === this.getViewData()) {
+				this.diskData = disk; // our own save
+				return;
+			}
+			this.data = disk;
+			this.setViewData(disk, false);
+		} catch (e) {
+			console.warn('[Free-Excel] Could not refresh the sheet', e);
+		} finally {
+			this.refreshing = false;
+		}
+	}
+
+	private markDirty(): void {
+		this.rowIndex = null;
+		if (this.loading) return;
+		this.dirty = true;
+		if (this.plugin.settings.autosave) this.requestSave();
+	}
+
+	applySettings(): void {
+		const s = this.plugin.settings;
+		const prev = this.appliedSettings;
+		this.appliedSettings = { ...s };
+		this.installAutosave();
+		if (
+			prev.autoRefresh !== s.autoRefresh ||
+			prev.refreshIntervalSec !== s.refreshIntervalSec
+		)
+			this.installRefreshTimer();
+
+		if (!prev.autosave && s.autosave && this.dirty) this.requestSave();
+
+		if (
+			prev.defaultFontSize !== s.defaultFontSize ||
+			prev.enableFormulas !== s.enableFormulas
+		) {
+			this.invalidateRowSizes();
+			if (this.hot && !this.hot.isDestroyed) this.hot.render();
+		}
+	}
+
+	/* ---------------- Model helpers ---------------- */
+
+	private normalizeModel(raw: unknown): SheetModel {
+		const base = createDefaultModel(
+			this.plugin.settings,
+			defaultSheetRtl(),
+		);
+		if (!raw || typeof raw !== 'object') return base;
+		const r = raw as Partial<SheetModel>;
+
+		let data = base.data;
+		if (
+			Array.isArray(r.data) &&
+			r.data.length > 0 &&
+			r.data.every((row) => Array.isArray(row))
+		) {
+			const width = Math.max(1, ...r.data.map((row) => row.length));
+			data = r.data.map((row) => {
+				const copy = row.slice() as Scalar[];
+				while (copy.length < width) copy.push(null);
+				return copy;
+			});
+		}
+
+		return {
+			version: typeof r.version === 'number' ? r.version : 2,
+			data,
+			cellFormats:
+				r.cellFormats && typeof r.cellFormats === 'object'
+					? r.cellFormats
+					: {},
+			images: r.images && typeof r.images === 'object' ? r.images : {},
+			imageSizes:
+				r.imageSizes && typeof r.imageSizes === 'object'
+					? r.imageSizes
+					: {},
+			widenRecords:
+				r.widenRecords && typeof r.widenRecords === 'object'
+					? r.widenRecords
+					: {},
+			merges: Array.isArray(r.merges) ? r.merges : [],
+			colWidths: Array.isArray(r.colWidths) ? r.colWidths : [],
+			rowHeights: Array.isArray(r.rowHeights) ? r.rowHeights : [],
+			rtl: typeof r.rtl === 'boolean' ? r.rtl : defaultSheetRtl(),
+		};
+	}
+
+	/**
+	 * Replaces the model under the live grid without rebuilding it, so an outside change
+	 * shows up without losing the selection or the scroll position. Returns false when
+	 * the grid has to be rebuilt instead.
+	 */
+	private applyModelInPlace(next: SheetModel): boolean {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed || next.rtl !== this.model.rtl) return false;
+
+		this.captureGridState(); // current merges, to compare with the new ones
+		const prev = this.model;
+		this.model = next;
+		this.rowIndex = null;
+
+		hot.updateData(next.data);
+		if (JSON.stringify(prev.merges) !== JSON.stringify(next.merges))
+			hot.updateSettings({ mergeCells: next.merges });
+
+		const nextCols = next.colWidths.slice();
+		const cols = Math.max(prev.colWidths.length, nextCols.length);
+		for (let i = 0; i < cols; i++) {
+			const w = nextCols[i] ?? null;
+			if ((prev.colWidths[i] ?? null) === w) continue;
+			if (w) this.setColumnWidth(i, w);
+			else this.clearColumnWidth(i);
+		}
+		const nextRows = next.rowHeights.slice();
+		const rows = Math.max(prev.rowHeights.length, nextRows.length);
+		for (let i = 0; i < rows; i++) {
+			const h = nextRows[i] ?? null;
+			if ((prev.rowHeights[i] ?? null) === h) continue;
+			if (h) this.setRowHeight(i, h);
+			else this.clearRowHeight(i);
+		}
+
+		hot.render();
+		this.refreshToolbarState();
+		return true;
+	}
+
+	/** Copies the live grid state (data and merges) into the model. */
+	private captureGridState(): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		this.model.data = hot.getSourceDataArray() as Scalar[][];
+		// The merged-cells collection is not part of Handsontable's public typings.
+		const mc = hot.getPlugin('mergeCells') as unknown as {
+			mergedCellsCollection?: {
+				mergedCells?: {
+					row: number;
+					col: number;
+					rowspan: number;
+					colspan: number;
+				}[];
+			};
+		};
+		const merged = mc.mergedCellsCollection?.mergedCells ?? [];
+		this.model.merges = merged.map((m) => ({
+			row: m.row,
+			col: m.col,
+			rowspan: m.rowspan,
+			colspan: m.colspan,
+		}));
+	}
+
+	private captureGridStateIfLive(): void {
+		if (this.hot && !this.hot.isDestroyed) this.captureGridState();
+	}
+
+	/** Shifts per-cell data (formats, images) after rows/columns are inserted or removed. */
+	private remapCellMaps(
+		axis: 'row' | 'col',
+		index: number,
+		amount: number,
+		mode: 'insert' | 'remove',
+	): void {
+		const remap = <T>(source: Record<string, T>): Record<string, T> => {
+			const next: Record<string, T> = {};
+			for (const [k, value] of Object.entries(source)) {
+				const parts = k.split(',').map(Number);
+				const r = parts[0] ?? 0;
+				const c = parts[1] ?? 0;
+				let pos = axis === 'row' ? r : c;
+				if (mode === 'insert') {
+					if (pos >= index) pos += amount;
+				} else {
+					if (pos >= index && pos < index + amount) continue;
+					if (pos >= index + amount) pos -= amount;
+				}
+				next[axis === 'row' ? key(pos, c) : key(r, pos)] = value;
+			}
+			return next;
+		};
+		if (axis === 'col' && this.model.widenRecords) {
+			const next: Record<string, { prevW: number | null; w: number }> =
+				{};
+			for (const [k, rec] of Object.entries(this.model.widenRecords)) {
+				let c = Number(k);
+				if (mode === 'insert') {
+					if (c >= index) c += amount;
+				} else {
+					if (c >= index && c < index + amount) continue;
+					if (c >= index + amount) c -= amount;
+				}
+				next[String(c)] = rec;
+			}
+			this.model.widenRecords = next;
+		}
+		this.model.cellFormats = remap(this.model.cellFormats);
+		this.model.images = remap(this.model.images);
+		this.model.imageSizes = remap(this.model.imageSizes);
+	}
+
+	private spliceSizes(
+		arr: (number | null)[],
+		index: number,
+		amount: number,
+		mode: 'insert' | 'remove',
+	): void {
+		while (arr.length < index) arr.push(null);
+		if (mode === 'insert')
+			arr.splice(index, 0, ...Array<null>(amount).fill(null));
+		else arr.splice(index, amount);
+	}
+
+	/* ---------------- Formula resolution ---------------- */
+
+	private resolveRaw(raw: unknown, depth: number, coerce: boolean): Scalar {
+		if (raw === undefined || raw === null) return null;
+		if (typeof raw === 'string') {
+			if (
+				this.plugin.settings.enableFormulas &&
+				raw.length > 1 &&
+				raw.startsWith('=')
+			) {
+				if (depth > 40) return '#CYCLE!';
+				return evaluateFormula(raw, (r, c) => {
+					const hot: Handsontable.Core | null =
+						this.gridForCalc ?? this.hot;
+					const cellRaw =
+						hot && !hot.isDestroyed
+							? hot.getSourceDataAtCell(r, c)
+							: null;
+					return this.resolveRaw(cellRaw, depth + 1, true);
+				});
+			}
+			if (coerce && NUMERIC_RE.test(raw)) return Number(raw);
+			return raw;
+		}
+		if (typeof raw === 'number' || typeof raw === 'boolean') return raw;
+		return String(raw);
+	}
+
+	/* ---------------- Grid lifecycle ---------------- */
+
+	destroyGrid(): void {
+		this.autocomplete.detach();
+		if (this.hot && !this.hot.isDestroyed) this.hot.destroy();
+		this.hot = null;
+		this.gridForCalc = null;
+		this.gridEl.empty();
+	}
+
+	private rebuildGrid(): void {
+		this.captureGridStateIfLive();
+		this.destroyGrid();
+
+		const m = this.model;
+		this.gridEl.setAttr('dir', m.rtl ? 'rtl' : 'ltr');
+		this.gridEl.toggleClass('is-rtl', m.rtl);
+
+		this.fontFamilyCache = null;
+		this.rowIndex = null;
+		const zoom = this.zoom;
+		const toSizes = (arr: (number | null)[]): (number | undefined)[] =>
+			arr.map((v) => (v ? Math.round(v * zoom) : undefined));
+
+		try {
+			const options: Handsontable.GridSettings = {
+				data: m.data,
+				licenseKey: 'non-commercial-and-evaluation',
+				themeName: handsontableThemeName(),
+				layoutDirection: m.rtl ? 'rtl' : 'ltr',
+				rowHeaders: true,
+				colHeaders: true,
+				width: '100%',
+				height: '100%',
+				manualColumnResize: toSizes(m.colWidths) as number[],
+				manualRowResize: toSizes(m.rowHeights) as number[],
+				// Functions (instead of auto-sizing) so the user decides column widths, and row heights
+				// always follow the font size; manual resizing still overrides both.
+				colWidths: () => Math.round(DEFAULT_COL_WIDTH * this.zoom),
+				rowHeights: (row: number) =>
+					Math.round(this.computeRowHeight(row) * this.zoom),
+				mergeCells: m.merges,
+				contextMenu: [
+					'row_above',
+					'row_below',
+					'col_left',
+					'col_right',
+					'---------',
+					'remove_row',
+					'remove_col',
+					'---------',
+					'undo',
+					'redo',
+					'---------',
+					'copy',
+					'cut',
+					'---------',
+					'mergeCells',
+				],
+				copyPaste: true,
+				undo: true,
+				fillHandle: !IS_TOUCH,
+				selectionMode: 'multiple',
+				outsideClickDeselects: false,
+				autoWrapRow: true,
+				autoWrapCol: true,
+				renderer: this.cellRenderer,
+				// Cells that hold an image cannot be typed into (the image would hide the text).
+				cells: (row, col) => ({
+					readOnly: !!this.model.images[key(row, col)],
+				}),
+				beforeKeyDown: (event) => this.onBeforeKeyDown(event),
+				afterChange: (changes, source) => {
+					if (source === 'loadData' || this.loading) return;
+					const expandCols: number[] = [];
+					for (const change of changes ?? []) {
+						const [row, prop] = change as unknown as [
+							number,
+							string | number,
+						];
+						const col = Number(prop);
+						if (
+							this.model.cellFormats[key(row, col)]?.wrap ===
+							'expand'
+						)
+							expandCols.push(col);
+					}
+					if (expandCols.length > 0)
+						this.fitExpandColumns(expandCols);
+					if (this.plugin.settings.enableFormulas && this.hot)
+						this.hot.render();
+					this.markDirty();
+					this.refreshToolbarState();
+				},
+				afterSelectionEnd: () => this.onSelectionChanged(),
+				afterBeginEditing: () => this.onBeginEditing(),
+				afterCreateRow: (index, amount) => {
+					if (this.loading) return;
+					this.remapCellMaps('row', index, amount, 'insert');
+					this.spliceSizes(
+						this.model.rowHeights,
+						index,
+						amount,
+						'insert',
+					);
+					this.markDirty();
+				},
+				afterRemoveRow: (index, amount) => {
+					if (this.loading) return;
+					this.remapCellMaps('row', index, amount, 'remove');
+					this.spliceSizes(
+						this.model.rowHeights,
+						index,
+						amount,
+						'remove',
+					);
+					this.markDirty();
+				},
+				afterCreateCol: (index, amount) => {
+					if (this.loading) return;
+					this.remapCellMaps('col', index, amount, 'insert');
+					this.spliceSizes(
+						this.model.colWidths,
+						index,
+						amount,
+						'insert',
+					);
+					this.markDirty();
+				},
+				afterRemoveCol: (index, amount) => {
+					if (this.loading) return;
+					this.remapCellMaps('col', index, amount, 'remove');
+					this.spliceSizes(
+						this.model.colWidths,
+						index,
+						amount,
+						'remove',
+					);
+					this.markDirty();
+				},
+				afterColumnResize: (newSize, column) => {
+					while (this.model.colWidths.length <= column)
+						this.model.colWidths.push(null);
+					this.model.colWidths[column] = Math.round(
+						newSize / this.zoom,
+					);
+					this.markDirty();
+				},
+				afterRowResize: (newSize, row) => {
+					while (this.model.rowHeights.length <= row)
+						this.model.rowHeights.push(null);
+					this.model.rowHeights[row] = Math.round(
+						newSize / this.zoom,
+					);
+					this.markDirty();
+				},
+				afterMergeCells: () => this.markDirty(),
+				afterUnmergeCells: () => this.markDirty(),
+				afterAutofill: (_fillData, sourceRange, targetRange) => {
+					this.copyFormatsOnFill(sourceRange, targetRange);
+				},
+			};
+
+			this.hot = new Handsontable(this.gridEl, options);
+			// The first render ran before `this.hot` existed; render again so formulas see all cells.
+			if (this.plugin.settings.enableFormulas) this.hot.render();
+			this.formulaCell = null;
+			this.refreshToolbarState();
+		} catch (e) {
+			this.plugin.reportError('Could not create the spreadsheet grid', e);
+		}
+	}
+
+	private copyFormatsOnFill(
+		source: {
+			from: { row: number | null; col: number | null };
+			to: { row: number | null; col: number | null };
+		},
+		target: {
+			from: { row: number | null; col: number | null };
+			to: { row: number | null; col: number | null };
+		},
+	): void {
+		const toRange = (rg: typeof source): SelRange => {
+			const fr = rg.from.row ?? 0;
+			const tr = rg.to.row ?? fr;
+			const fc = rg.from.col ?? 0;
+			const tc = rg.to.col ?? fc;
+			return {
+				r1: Math.min(fr, tr),
+				r2: Math.max(fr, tr),
+				c1: Math.min(fc, tc),
+				c2: Math.max(fc, tc),
+			};
+		};
+		const s = toRange(source);
+		const t = toRange(target);
+		const h = s.r2 - s.r1 + 1;
+		const w = s.c2 - s.c1 + 1;
+		for (let r = t.r1; r <= t.r2; r++) {
+			for (let c = t.c1; c <= t.c2; c++) {
+				const sr = s.r1 + ((((r - s.r1) % h) + h) % h);
+				const sc = s.c1 + ((((c - s.c1) % w) + w) % w);
+				const f = this.model.cellFormats[key(sr, sc)];
+				if (f) this.model.cellFormats[key(r, c)] = cloneFormat(f);
+				else delete this.model.cellFormats[key(r, c)];
+			}
+		}
+	}
+
+	/** Row heights are computed from the fonts; call after anything that can change them. */
+	private invalidateRowSizes(): void {
+		this.rowIndex = null;
+	}
+
+	private getRowIndex(): Map<number, number[]> {
+		if (this.rowIndex) return this.rowIndex;
+		const index = new Map<number, number[]>();
+		for (const k of Object.keys(this.model.cellFormats)) {
+			const parts = k.split(',').map(Number);
+			const r = parts[0];
+			const c = parts[1];
+			if (r === undefined || c === undefined) continue;
+			const list = index.get(r);
+			if (list) list.push(c);
+			else index.set(r, [c]);
+		}
+		this.rowIndex = index;
+		return index;
+	}
+
+	/**
+	 * Height of a row in unzoomed px: tall enough for the biggest font in it (like Google
+	 * Sheets), for the wrapped lines of "wrap" cells and for vertical text.
+	 */
+	private computeRowHeight(row: number): number {
+		const defaultSize = this.plugin.settings.defaultFontSize;
+		let height = rowBaseHeight(defaultSize);
+		const cols = this.getRowIndex().get(row);
+		if (!cols) return height;
+
+		const hot: Handsontable.Core | null = this.gridForCalc ?? this.hot;
+		for (const col of cols) {
+			const f = this.model.cellFormats[key(row, col)];
+			if (!f) continue;
+			const size = f.fontSize ?? defaultSize;
+			let need = rowBaseHeight(size);
+			const vertical = f.rotate === 90 || f.rotate === -90;
+			if ((f.wrap === 'wrap' || vertical) && hot && !hot.isDestroyed) {
+				const display = this.resolveRaw(
+					hot.getSourceDataAtCell(row, col),
+					0,
+					false,
+				);
+				const text = display === null ? '' : String(display);
+				if (text) {
+					if (vertical) {
+						need = Math.max(
+							need,
+							Math.ceil(this.measureTextWidth(text, f)) + 16,
+						);
+					} else {
+						const colWidth =
+							this.model.colWidths[col] || DEFAULT_COL_WIDTH;
+						const lines = this.countWrappedLines(
+							text,
+							Math.max(20, colWidth - 2 * CELL_PADDING),
+							f,
+						);
+						need = Math.max(
+							need,
+							lines * Math.ceil(size * ROW_LINE_HEIGHT) +
+								ROW_VERTICAL_PADDING,
+						);
+					}
+				}
+			}
+			height = Math.max(height, need);
+		}
+		return height;
+	}
+
+	private countWrappedLines(
+		text: string,
+		maxWidth: number,
+		f: CellFormat,
+	): number {
+		const space = this.measureTextWidth(' ', f);
+		let total = 0;
+		for (const paragraph of text.split('\n')) {
+			const words = paragraph.split(/\s+/).filter((w) => w !== '');
+			if (words.length === 0) {
+				total += 1;
+				continue;
+			}
+			let lines = 1;
+			let lineWidth = 0;
+			for (const word of words) {
+				const w = this.measureTextWidth(word, f);
+				if (lineWidth === 0) {
+					lineWidth = w;
+				} else if (lineWidth + space + w <= maxWidth) {
+					lineWidth += space + w;
+				} else {
+					lines += 1;
+					lineWidth = w;
+				}
+				if (w > maxWidth) {
+					// A word longer than the cell is broken across lines.
+					lines += Math.floor(w / maxWidth);
+					lineWidth = w % maxWidth;
+				}
+			}
+			total += lines;
+		}
+		return total;
+	}
+
+	private fontFamily(): string {
+		if (!this.fontFamilyCache) {
+			this.fontFamilyCache =
+				getComputedStyle(this.gridEl).fontFamily || 'sans-serif';
+		}
+		return this.fontFamilyCache;
+	}
+
+	/** Width of text in unzoomed px. */
+	private measureTextWidth(text: string, f: CellFormat | undefined): number {
+		if (!this.measureCtx)
+			this.measureCtx = activeDocument
+				.createElement('canvas')
+				.getContext('2d');
+		const ctx = this.measureCtx;
+		if (!ctx) return 0;
+		const size = f?.fontSize ?? this.plugin.settings.defaultFontSize;
+		ctx.font = `${f?.italic ? 'italic ' : ''}${f?.bold ? 'bold ' : ''}${size}px ${this.fontFamily()}`;
+		return ctx.measureText(text).width;
+	}
+
+	/* ---------------- Cell editor ---------------- */
+
+	private onBeginEditing(): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const editor = hot.getActiveEditor() as unknown as
+			| { TEXTAREA?: HTMLTextAreaElement }
+			| undefined;
+		const textarea = editor?.TEXTAREA;
+		if (!textarea) return;
+
+		// dir="auto" makes formulas such as =SUM(A1) render left-to-right even in an RTL sheet,
+		// while Hebrew text still renders right-to-left.
+		textarea.setAttribute('dir', 'auto');
+		textarea.setAttribute('autocapitalize', 'off');
+		textarea.setAttribute('autocorrect', 'off');
+		textarea.spellcheck = false;
+		this.autocomplete.attach(textarea);
+	}
+
+	/* ---------------- Renderer ---------------- */
+
+	private readonly cellRenderer = (
+		instance: Handsontable.Core,
+		td: HTMLTableCellElement,
+		row: number,
+		col: number,
+		prop: string | number,
+		value: unknown,
+		cellProperties: Handsontable.CellProperties,
+	): void => {
+		this.gridForCalc = instance;
+
+		const display = this.resolveRaw(value, 0, false);
+		const isNumber =
+			typeof display === 'number' ||
+			(typeof display === 'string' && NUMERIC_RE.test(display));
+		const text =
+			display === null
+				? ''
+				: typeof display === 'boolean'
+					? display
+						? 'TRUE'
+						: 'FALSE'
+					: String(display);
+
+		baseTextRenderer(instance, td, row, col, prop, text, cellProperties);
+		// Image cells are read-only, but they should not be greyed out like other read-only cells.
+		td.classList.remove('htDimmed');
+		td.querySelectorAll('.rtl-sheet-spill-eraser').forEach((el) =>
+			el.remove(),
+		);
+
+		const f = this.model.cellFormats[key(row, col)];
+		const imagePath = this.model.images[key(row, col)];
+		const rtl = this.model.rtl;
+		const wrap = f?.wrap ?? 'overflow';
+		const st = td.style;
+
+		st.fontSize = `${Math.round((f?.fontSize ?? this.plugin.settings.defaultFontSize) * this.zoom * 10) / 10}px`;
+		// Line height follows the font size; the theme's fixed line height made big wrapped text overlap.
+		st.lineHeight = String(ROW_LINE_HEIGHT);
+		st.fontWeight = f?.bold ? 'bold' : '';
+		st.fontStyle = f?.italic ? 'italic' : '';
+		st.textDecoration = [
+			f?.underline ? 'underline' : '',
+			f?.strike ? 'line-through' : '',
+		]
+			.filter((part) => part !== '')
+			.join(' ');
+		st.backgroundColor = f?.bgColor ?? '';
+		st.color = f?.textColor ?? '';
+		st.textAlign =
+			f?.align ?? (isNumber ? 'right' : rtl ? 'right' : 'left');
+		st.verticalAlign = f?.valign ?? '';
+		st.direction = rtl && isNumber ? 'ltr' : '';
+		st.unicodeBidi = rtl && !isNumber ? 'plaintext' : '';
+		st.whiteSpace = wrap === 'wrap' ? 'pre-wrap' : 'nowrap';
+		st.wordBreak = wrap === 'wrap' ? 'break-word' : '';
+		st.overflow = '';
+		st.position = '';
+		st.zIndex = '';
+		st.clipPath = '';
+		applyBorderStyles(st, f?.borders);
+
+		if (imagePath) {
+			this.renderImage(td, imagePath);
+		} else if (f?.rotate) {
+			this.renderRotated(td, text, f.rotate);
+		} else if (wrap === 'overflow') {
+			const spill = this.spillInfo(instance, row, col, text, isNumber, f);
+			if (spill) {
+				st.overflow = 'visible';
+				st.position = 'relative';
+				st.zIndex = '1';
+				// Paint the overflow only as far as the empty cells it spills into.
+				st.clipPath = spill.visualRight
+					? `inset(0 -${spill.extra}px 0 0)`
+					: `inset(0 0 0 -${spill.extra}px)`;
+				// Hide the vertical grid lines the text crosses (like Google Sheets). The erasers sit
+				// behind the text (z-index -1 inside this cell) but above the cell borders.
+				const eraserColor =
+					f?.bgColor ??
+					'var(--ht-cell-background-color, var(--background-primary))';
+				for (const offset of spill.lines) {
+					const eraser = td.createDiv({
+						cls: 'rtl-sheet-spill-eraser',
+					});
+					eraser.style.background = eraserColor;
+					if (spill.visualRight)
+						eraser.style.left = `${offset - 2}px`;
+					else eraser.style.right = `${offset - 2}px`;
+				}
+			}
+		}
+	};
+
+	/**
+	 * Text that is wider than its cell spills into the empty cells next to it (like Excel).
+	 * Numbers and numeric formula results never spill: only text, and only as far as needed.
+	 */
+	private spillInfo(
+		hot: Handsontable.Core,
+		row: number,
+		col: number,
+		text: string,
+		isNumber: boolean,
+		f: CellFormat | undefined,
+	): { visualRight: boolean; extra: number; lines: number[] } | null {
+		if (!text || isNumber || f?.align === 'center') return null;
+
+		const own = hot.getColWidth(col);
+		const needed =
+			this.measureTextWidth(text, f) * this.zoom + 2 * CELL_PADDING;
+		if (needed <= own) return null; // it fits: nothing crosses the cell border
+
+		const visualRight = !/[\u0590-\u08FF]/.test(text);
+		// In an RTL sheet, column index + 1 is the visually-left neighbour.
+		const delta = visualRight === !this.model.rtl ? 1 : -1;
+
+		const lines: number[] = [own]; // the cell's own border is crossed
+		let reach = own;
+		let extra = 0;
+		for (let c = col + delta; c >= 0 && c < hot.countCols(); c += delta) {
+			const raw: unknown = hot.getSourceDataAtCell(row, c);
+			if (
+				!(raw === null || raw === undefined || raw === '') ||
+				this.model.images[key(row, c)]
+			)
+				break;
+			const w = hot.getColWidth(c);
+			extra += w;
+			reach += w;
+			if (needed <= reach) break;
+			lines.push(reach);
+		}
+		return extra > 0 ? { visualRight, extra, lines } : null;
+	}
+
+	private renderRotated(
+		td: HTMLTableCellElement,
+		text: string,
+		rotate: number,
+	): void {
+		td.textContent = '';
+		const span = td.createSpan({ cls: 'rtl-sheet-rotated', text });
+		if (rotate === 90) {
+			span.style.writingMode = 'vertical-rl';
+			span.style.transform = 'rotate(180deg)';
+		} else if (rotate === -90) {
+			span.style.writingMode = 'vertical-rl';
+		} else {
+			span.style.transform = `rotate(${-rotate}deg)`;
+		}
+	}
+
+	private renderImage(td: HTMLTableCellElement, path: string): void {
+		td.textContent = '';
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) {
+			td.setText('Missing image');
+			return;
+		}
+		td.style.position = 'relative';
+		td.createEl('img', {
+			cls: 'rtl-sheet-img',
+			attr: {
+				src: this.app.vault.getResourcePath(file),
+				alt: file.name,
+				draggable: 'false',
+			},
+		});
+	}
+
+	/* ---------------- Formula bar ---------------- */
+
+	private buildFormulaBar(): void {
+		const bar = this.formulaBarEl;
+		bar.empty();
+
+		this.ui.address = bar.createDiv({ cls: 'rtl-sheet-address' });
+		this.addButton(bar, '', 'fx', 'Insert function', () =>
+			this.openFunctionPicker(),
+		);
+
+		const input = bar.createEl('input', {
+			type: 'text',
+			cls: 'rtl-sheet-formula-input',
+			attr: {
+				placeholder: 'Value or formula, e.g. =SUM(A1:A3)',
+				dir: 'auto',
+				spellcheck: 'false',
+				autocomplete: 'off',
+				autocapitalize: 'off',
+				autocorrect: 'off',
+			},
+		});
+		this.ui.formulaInput = input;
+		this.autocomplete.attach(input);
+
+		input.addEventListener('focus', () => {
+			this.formulaEditCell = this.formulaCell;
+			this.hot?.unlisten();
+		});
+		input.addEventListener('blur', () => {
+			this.commitFormulaBar();
+			this.hot?.listen();
+		});
+		input.addEventListener('keydown', (e) => {
+			if (e.key === 'Enter') {
+				e.preventDefault();
+				this.commitFormulaBar();
+				input.blur();
+			} else if (e.key === 'Escape') {
+				this.refreshToolbarState(true);
+				input.blur();
+			}
+		});
+	}
+
+	private commitFormulaBar(): void {
+		const hot = this.hot;
+		const input = this.ui.formulaInput;
+		const cell = this.formulaEditCell ?? this.formulaCell;
+		if (!hot || hot.isDestroyed || !input || !cell) return;
+		const current = hot.getSourceDataAtCell(cell.row, cell.col) as unknown;
+		const currentText =
+			current === null || current === undefined ? '' : String(current);
+		if (input.value === currentText) return;
+		hot.setDataAtCell(
+			cell.row,
+			cell.col,
+			input.value === '' ? null : input.value,
+		);
+	}
+
+	private openFunctionPicker(): void {
+		new FunctionPickerModal(this.app, (fn) => {
+			// Let the modal finish closing before touching focus.
+			window.setTimeout(() => this.insertFunction(fn), 50);
+		}).open();
+	}
+
+	private insertFunction(fn: FormulaFunctionInfo): void {
+		const input = this.ui.formulaInput;
+		if (!input) return;
+		if (!this.formulaCell) {
+			new Notice('Select a cell first.');
+			return;
+		}
+		this.formulaEditCell = this.formulaCell;
+		input.focus();
+
+		let value = input.value;
+		let start = input.selectionStart ?? value.length;
+		let end = input.selectionEnd ?? start;
+		if (!value.startsWith('=')) {
+			value = '=';
+			start = 1;
+			end = 1;
+		}
+		const call = buildFunctionCall(fn);
+		input.value = `${value.slice(0, start)}${call.text}${value.slice(end)}`;
+		input.setSelectionRange(start + call.selectFrom, start + call.selectTo);
+	}
+
+	/* ---------------- Toolbar ---------------- */
+
+	private buildToolbar(): void {
+		const tb = this.toolbarEl;
+		tb.empty();
+		this.ui.toggles = {};
+		const group = (): HTMLElement =>
+			tb.createDiv({ cls: 'rtl-sheet-toolbar-group' });
+
+		let g = group();
+		this.addButton(g, 'undo', 'Undo', 'Undo', () => this.undoRedo('undo'));
+		this.addButton(g, 'redo', 'Redo', 'Redo', () => this.undoRedo('redo'));
+		this.ui.brush = this.addButton(
+			g,
+			'paintbrush',
+			'Brush',
+			'Format painter: copy the formatting of the selected cell, then select the cells to apply it to',
+			() => this.toggleFormatPainter(),
+		);
+
+		g = group();
+		this.ui.fontSelect = this.addSelect(
+			g,
+			'Font size',
+			[
+				{ value: '', label: 'Size' },
+				...FONT_SIZES.map((s) => ({
+					value: String(s),
+					label: String(s),
+				})),
+			],
+			(ranges, value) =>
+				this.applyFormat(ranges, (f) => {
+					if (value) f.fontSize = Number(value);
+					else delete f.fontSize;
+				}),
+		);
+		this.addToggle(g, 'bold', 'bold', 'B', 'Bold', () =>
+			this.toggleFlag('bold'),
+		);
+		this.addToggle(g, 'italic', 'italic', 'I', 'Italic', () =>
+			this.toggleFlag('italic'),
+		);
+		this.addToggle(g, 'underline', 'underline', 'U', 'Underline', () =>
+			this.toggleFlag('underline'),
+		);
+		this.addToggle(g, 'strike', 'strikethrough', 'S', 'Strikethrough', () =>
+			this.toggleFlag('strike'),
+		);
+
+		g = group();
+		this.addColorPicker(
+			g,
+			'Fill',
+			'Cell fill color',
+			'#ffff00',
+			(ranges, color) =>
+				this.applyFormat(ranges, (f) => {
+					f.bgColor = color;
+				}),
+		);
+		this.addButton(g, 'eraser', 'x', 'Clear fill color', () =>
+			this.applyFormat(this.requireSelection(), (f) => {
+				delete f.bgColor;
+			}),
+		);
+		this.addColorPicker(
+			g,
+			'Text',
+			'Text color',
+			'#d00000',
+			(ranges, color) =>
+				this.applyFormat(ranges, (f) => {
+					f.textColor = color;
+				}),
+		);
+		this.addButton(g, 'eraser', 'x', 'Clear text color', () =>
+			this.applyFormat(this.requireSelection(), (f) => {
+				delete f.textColor;
+			}),
+		);
+
+		g = group();
+		this.addToggle(
+			g,
+			'align-left',
+			'align-left',
+			'Left',
+			'Align left',
+			() => this.setFormatProp('align', 'left'),
+		);
+		this.addToggle(
+			g,
+			'align-center',
+			'align-center',
+			'Center',
+			'Align center',
+			() => this.setFormatProp('align', 'center'),
+		);
+		this.addToggle(
+			g,
+			'align-right',
+			'align-right',
+			'Right',
+			'Align right',
+			() => this.setFormatProp('align', 'right'),
+		);
+
+		g = group();
+		this.addToggle(
+			g,
+			'valign-top',
+			'align-vertical-justify-start',
+			'Top',
+			'Align top',
+			() => this.setFormatProp('valign', 'top'),
+		);
+		this.addToggle(
+			g,
+			'valign-middle',
+			'align-vertical-justify-center',
+			'Middle',
+			'Align middle',
+			() => this.setFormatProp('valign', 'middle'),
+		);
+		this.addToggle(
+			g,
+			'valign-bottom',
+			'align-vertical-justify-end',
+			'Bottom',
+			'Align bottom',
+			() => this.setFormatProp('valign', 'bottom'),
+		);
+
+		g = group();
+		this.addToggle(
+			g,
+			'wrap-expand',
+			'move-horizontal',
+			'Widen',
+			'Excess text: widen the column to fit the text',
+			() => this.setFormatProp('wrap', 'expand'),
+		);
+		this.addToggle(
+			g,
+			'wrap-overflow',
+			'arrow-right-from-line',
+			'Spill',
+			'Excess text: spill into the neighbouring cell (only if it is empty)',
+			() => this.setFormatProp('wrap', 'overflow'),
+		);
+		this.addToggle(
+			g,
+			'wrap-wrap',
+			'wrap-text',
+			'Wrap',
+			'Excess text: continue on a new line inside the same cell (the column keeps its width)',
+			() => this.setFormatProp('wrap', 'wrap'),
+		);
+		this.ui.rotateSelect = this.addSelect(
+			g,
+			'Text rotation',
+			ROTATIONS.map((r) => ({ value: String(r.value), label: r.label })),
+			(ranges, value) =>
+				this.applyFormat(ranges, (f) => {
+					const n = Number(value);
+					if (n) f.rotate = n;
+					else delete f.rotate;
+				}),
+		);
+
+		g = group();
+		this.addButton(g, 'merge', 'Merge', 'Merge cells', () =>
+			this.mergeSelection(),
+		);
+		this.addButton(g, 'split', 'Unmerge', 'Unmerge cells', () =>
+			this.unmergeSelection(),
+		);
+
+		g = group();
+		const bordersBtn: HTMLButtonElement = this.addButton(
+			g,
+			'grid-3x3',
+			'Borders',
+			'Borders',
+			() =>
+				this.showMenu(bordersBtn, [
+					{
+						title: 'All borders (every selected cell)',
+						icon: 'grid-3x3',
+						onClick: () => this.applyBorders('all'),
+					},
+					{
+						title: 'Outer frame only',
+						icon: 'square',
+						onClick: () => this.applyBorders('outer'),
+					},
+					{
+						title: 'Top edge of the selection',
+						icon: 'panel-top',
+						onClick: () => this.applyBorders('top'),
+					},
+					{
+						title: 'Bottom edge of the selection',
+						icon: 'panel-bottom',
+						onClick: () => this.applyBorders('bottom'),
+					},
+					{
+						title: 'Left edge of the selection',
+						icon: 'panel-left',
+						onClick: () => this.applyBorders('left'),
+					},
+					{
+						title: 'Right edge of the selection',
+						icon: 'panel-right',
+						onClick: () => this.applyBorders('right'),
+					},
+					{
+						title: 'No borders',
+						icon: 'ban',
+						onClick: () => this.applyBorders('none'),
+					},
+				]),
+		);
+		this.addColorPicker(
+			g,
+			'Border',
+			'Border color',
+			'#000000',
+			(ranges, color) =>
+				this.applyFormat(ranges, (f) => {
+					f.borders = {
+						top: true,
+						right: true,
+						bottom: true,
+						left: true,
+						...(f.borders ?? {}),
+						color,
+					};
+				}),
+		);
+
+		g = group();
+		const imageBtn: HTMLButtonElement = this.addButton(
+			g,
+			'image',
+			'Image',
+			'Insert image into the selected cell',
+			() =>
+				this.showMenu(imageBtn, [
+					{
+						title: 'Choose from vault…',
+						icon: 'folder-open',
+						onClick: () => this.pickImageFromVault(),
+					},
+					{
+						title: 'Upload from device…',
+						icon: 'upload',
+						onClick: () => void this.pickImageFromDevice(),
+					},
+					{
+						title: 'Paste from clipboard',
+						icon: 'clipboard-paste',
+						onClick: () => void this.pasteImageFromClipboard(),
+					},
+				]),
+		);
+		this.addButton(
+			g,
+			'image-off',
+			'No image',
+			'Remove image from the selected cells',
+			() => this.removeImages(),
+		);
+
+		g = group();
+		const importBtn: HTMLButtonElement = this.addButton(
+			g,
+			'file-input',
+			'Import',
+			'Import an Excel (.xlsx) or CSV file into this sheet',
+			() =>
+				this.showMenu(importBtn, [
+					{
+						title: 'From this device…',
+						icon: 'upload',
+						onClick: () => void this.importFromDevice(),
+					},
+					{
+						title: 'From vault…',
+						icon: 'folder-open',
+						onClick: () => this.importFromVault(),
+					},
+				]),
+		);
+		this.addButton(
+			g,
+			'download',
+			'Export',
+			'Export to Excel (.xlsx)',
+			() => {
+				void this.exportToXlsx();
+			},
+		);
+
+		if (IS_TOUCH) {
+			// Long-press context menus are not reliable on every touch platform,
+			// so rows and columns get explicit buttons.
+			g = group();
+			this.addButton(g, '', '+Row', 'Insert row below', () =>
+				this.alterStructure('insert_row_below'),
+			);
+			this.addButton(g, '', '-Row', 'Delete selected rows', () =>
+				this.alterStructure('remove_row'),
+			);
+			this.addButton(g, '', '+Col', 'Insert column after', () =>
+				this.alterStructure('insert_col_end'),
+			);
+			this.addButton(g, '', '-Col', 'Delete selected columns', () =>
+				this.alterStructure('remove_col'),
+			);
+		}
+
+		g = group();
+		this.addButton(g, '', '-', 'Zoom out', () =>
+			this.applyZoom(this.zoom - 0.1),
+		);
+		this.ui.zoomLabel = this.addButton(
+			g,
+			'',
+			'100%',
+			'Reset zoom to 100%',
+			() => this.applyZoom(1),
+		);
+		this.addButton(g, '', '+', 'Zoom in', () =>
+			this.applyZoom(this.zoom + 0.1),
+		);
+
+		g = group();
+		this.addButton(
+			g,
+			'arrow-left-right',
+			'RTL/LTR',
+			'Toggle RTL / LTR',
+			() => this.toggleDirection(),
+		);
+	}
+
+	private addButton(
+		parent: HTMLElement,
+		icon: string,
+		label: string,
+		title: string,
+		onClick: () => void,
+	): HTMLButtonElement {
+		const btn = parent.createEl('button', {
+			cls: 'rtl-sheet-btn',
+			attr: { 'aria-label': title, title },
+		});
+		if (icon) setIcon(btn, icon);
+		if (!btn.querySelector('svg')) btn.setText(label);
+		// Keep the grid selection intact while clicking toolbar buttons.
+		btn.addEventListener('mousedown', (e) => e.preventDefault());
+		btn.addEventListener('click', () => {
+			try {
+				onClick();
+			} catch (e) {
+				this.plugin.reportError(title, e);
+			}
+		});
+		return btn;
+	}
+
+	private addToggle(
+		parent: HTMLElement,
+		name: string,
+		icon: string,
+		label: string,
+		title: string,
+		onClick: () => void,
+	): void {
+		this.ui.toggles[name] = this.addButton(
+			parent,
+			icon,
+			label,
+			title,
+			onClick,
+		);
+	}
+
+	/**
+	 * Remembers the selection when a control is first touched, so that opening a
+	 * picker and clicking elsewhere in the grid cannot redirect the change to a
+	 * different cell.
+	 */
+	private bindRangeControl(
+		el: HTMLElement,
+		eventName: 'input' | 'change',
+		handler: (ranges: SelRange[]) => void,
+	): void {
+		let captured: SelRange[] = [];
+		const capture = (): void => {
+			const current = this.getSelectedRanges();
+			if (current.length > 0) captured = current;
+		};
+		el.addEventListener('pointerdown', capture);
+		el.addEventListener('focus', capture);
+		el.addEventListener(eventName, () => {
+			const ranges =
+				captured.length > 0 ? captured : this.getSelectedRanges();
+			if (ranges.length === 0) {
+				new Notice('Select one or more cells first.');
+				return;
+			}
+			try {
+				handler(ranges);
+			} catch (e) {
+				this.plugin.reportError('Could not apply formatting', e);
+			}
+		});
+	}
+
+	private addColorPicker(
+		parent: HTMLElement,
+		label: string,
+		title: string,
+		initial: string,
+		onPick: (ranges: SelRange[], color: string) => void,
+	): void {
+		const wrap = parent.createEl('label', {
+			cls: 'rtl-sheet-color',
+			attr: { title },
+		});
+		wrap.createSpan({ text: label });
+		const input = wrap.createEl('input', { type: 'color' });
+		input.value = initial;
+		this.bindRangeControl(input, 'input', (ranges) =>
+			onPick(ranges, input.value),
+		);
+	}
+
+	private addSelect(
+		parent: HTMLElement,
+		title: string,
+		options: { value: string; label: string }[],
+		onChange: (ranges: SelRange[], value: string) => void,
+	): HTMLSelectElement {
+		const select = parent.createEl('select', {
+			cls: 'dropdown rtl-sheet-select',
+			attr: { title, 'aria-label': title },
+		});
+		for (const o of options)
+			select.createEl('option', { value: o.value, text: o.label });
+		this.bindRangeControl(select, 'change', (ranges) =>
+			onChange(ranges, select.value),
+		);
+		return select;
+	}
+
+	private showMenu(anchor: HTMLElement, entries: MenuEntry[]): void {
+		const menu = new Menu();
+		for (const entry of entries) {
+			menu.addItem((item) =>
+				item
+					.setTitle(entry.title)
+					.setIcon(entry.icon)
+					.onClick(entry.onClick),
+			);
+		}
+		const rect = anchor.getBoundingClientRect();
+		menu.showAtPosition({ x: rect.left, y: rect.bottom });
+	}
+
+	/** Syncs button highlights, selects and the formula bar with the active cell. */
+	private refreshToolbarState(forceFormulaBar = false): void {
+		const cell = this.formulaCell;
+		const f = cell
+			? this.model.cellFormats[key(cell.row, cell.col)]
+			: undefined;
+		const setActive = (name: string, on: boolean): void => {
+			this.ui.toggles[name]?.toggleClass('is-active', on);
+		};
+		setActive('bold', !!f?.bold);
+		setActive('italic', !!f?.italic);
+		setActive('underline', !!f?.underline);
+		setActive('strike', !!f?.strike);
+		setActive('align-left', f?.align === 'left');
+		setActive('align-center', f?.align === 'center');
+		setActive('align-right', f?.align === 'right');
+		setActive('valign-top', f?.valign === 'top');
+		setActive('valign-middle', f?.valign === 'middle');
+		setActive('valign-bottom', f?.valign === 'bottom');
+		setActive('wrap-expand', f?.wrap === 'expand');
+		setActive('wrap-wrap', f?.wrap === 'wrap');
+		setActive('wrap-overflow', (f?.wrap ?? 'overflow') === 'overflow');
+
+		if (this.ui.fontSelect)
+			this.ui.fontSelect.value = f?.fontSize ? String(f.fontSize) : '';
+		if (this.ui.rotateSelect)
+			this.ui.rotateSelect.value = String(f?.rotate ?? 0);
+
+		this.ui.address?.setText(
+			cell ? `${indexToColumnLabel(cell.col)}${cell.row + 1}` : '',
+		);
+		const input = this.ui.formulaInput;
+		if (
+			input &&
+			(forceFormulaBar || input.ownerDocument.activeElement !== input)
+		) {
+			const hot = this.hot;
+			const raw: unknown =
+				cell && hot && !hot.isDestroyed
+					? hot.getSourceDataAtCell(cell.row, cell.col)
+					: null;
+			input.value = raw === null || raw === undefined ? '' : String(raw);
+		}
+	}
+
+	private onSelectionChanged(): void {
+		const first = this.getSelectedRanges()[0];
+		this.formulaCell = first ? { row: first.r1, col: first.c1 } : null;
+
+		if (this.painterSource) {
+			const ranges = this.getSelectedRanges();
+			const source = this.painterSource;
+			this.applyFormat(ranges, (f) => {
+				for (const k of Object.keys(f))
+					delete (f as Record<string, unknown>)[k];
+				Object.assign(f, cloneFormat(source));
+			});
+			// One-shot on desktop; stays on for touch so several taps can be painted.
+			if (!IS_TOUCH) this.setPainter(null);
+		}
+		this.refreshToolbarState();
+	}
+
+	/* ---------------- Formatting actions ---------------- */
+
+	private getSelectedRanges(): SelRange[] {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return [];
+		const sel = hot.getSelected();
+		if (!sel) return [];
+		return sel
+			.map((sel0) => {
+				const [a = 0, b = 0, c = 0, d = 0] = sel0 as number[];
+				return {
+					r1: Math.max(0, Math.min(a, c)),
+					c1: Math.max(0, Math.min(b, d)),
+					r2: Math.max(a, c),
+					c2: Math.max(b, d),
+				};
+			})
+			.filter((rg) => rg.r2 >= 0 && rg.c2 >= 0);
+	}
+
+	private requireSelection(): SelRange[] {
+		const ranges = this.getSelectedRanges();
+		if (ranges.length === 0) new Notice('Select one or more cells first.');
+		return ranges;
+	}
+
+	private applyFormat(
+		ranges: SelRange[],
+		mutate: (f: CellFormat, r: number, c: number, range: SelRange) => void,
+	): void {
+		if (ranges.length === 0 || !this.hot) return;
+		for (const rg of ranges) {
+			for (let r = rg.r1; r <= rg.r2; r++) {
+				for (let c = rg.c1; c <= rg.c2; c++) {
+					const k = key(r, c);
+					const f: CellFormat = {
+						...(this.model.cellFormats[k] ?? {}),
+					};
+					mutate(f, r, c, rg);
+					if (isEmptyFormat(f)) delete this.model.cellFormats[k];
+					else this.model.cellFormats[k] = f;
+				}
+			}
+		}
+		this.invalidateRowSizes();
+		const cols = new Set<number>();
+		for (const rg of ranges)
+			for (let c = rg.c1; c <= rg.c2; c++) cols.add(c);
+		this.fitExpandColumns(cols);
+		this.hot.render();
+		this.markDirty();
+		this.refreshToolbarState();
+	}
+
+	private toggleFlag(flag: 'bold' | 'italic' | 'underline' | 'strike'): void {
+		const ranges = this.requireSelection();
+		const firstRange = ranges[0];
+		if (!firstRange) return;
+		const turnOn =
+			!this.model.cellFormats[key(firstRange.r1, firstRange.c1)]?.[flag];
+		this.applyFormat(ranges, (f) => {
+			if (turnOn) f[flag] = true;
+			else delete f[flag];
+		});
+	}
+
+	/** Sets a format property; pressing the same option again clears it. */
+	private setFormatProp<K extends 'align' | 'valign' | 'wrap'>(
+		prop: K,
+		value: NonNullable<CellFormat[K]>,
+	): void {
+		const ranges = this.requireSelection();
+		const firstRange = ranges[0];
+		if (!firstRange) return;
+		const same =
+			this.model.cellFormats[key(firstRange.r1, firstRange.c1)]?.[
+				prop
+			] === value;
+		this.applyFormat(ranges, (f) => {
+			if (same) delete f[prop];
+			else (f as Record<string, unknown>)[prop] = value;
+		});
+	}
+
+	/**
+	 * Left/right are visual (physical) sides. In an RTL sheet the column with the
+	 * smaller index is the visually right-most one, so the two are swapped there.
+	 * Single-edge modes add to the existing borders; "outer" and "all" replace them.
+	 */
+	private applyBorders(mode: BorderMode): void {
+		const rtl = this.model.rtl;
+		this.applyFormat(this.requireSelection(), (f, r, c, rg) => {
+			const prev = f.borders ?? {};
+			const withColor = (b: CellBorders): CellBorders =>
+				prev.color ? { ...b, color: prev.color } : b;
+			const visualLeft = rtl ? rg.c2 : rg.c1;
+			const visualRight = rtl ? rg.c1 : rg.c2;
+			switch (mode) {
+				case 'none':
+					delete f.borders;
+					break;
+				case 'all':
+					f.borders = withColor({
+						top: true,
+						right: true,
+						bottom: true,
+						left: true,
+					});
+					break;
+				case 'outer':
+					f.borders = withColor({
+						top: r === rg.r1,
+						bottom: r === rg.r2,
+						left: c === visualLeft,
+						right: c === visualRight,
+					});
+					break;
+				case 'top':
+					if (r === rg.r1)
+						f.borders = withColor({ ...prev, top: true });
+					break;
+				case 'bottom':
+					if (r === rg.r2)
+						f.borders = withColor({ ...prev, bottom: true });
+					break;
+				case 'left':
+					if (c === visualLeft)
+						f.borders = withColor({ ...prev, left: true });
+					break;
+				case 'right':
+					if (c === visualRight)
+						f.borders = withColor({ ...prev, right: true });
+					break;
+			}
+		});
+	}
+
+	private toggleFormatPainter(): void {
+		if (this.painterSource) {
+			this.setPainter(null);
+			return;
+		}
+		const cell = this.formulaCell;
+		if (!cell) {
+			new Notice('Select the cell to copy the formatting from first.');
+			return;
+		}
+		this.setPainter(
+			cloneFormat(this.model.cellFormats[key(cell.row, cell.col)] ?? {}),
+		);
+		new Notice(
+			IS_TOUCH
+				? 'Format painter on: tap the cells to format. Tap the brush again to turn it off.'
+				: 'Format painter on: select the cells to format.',
+		);
+	}
+
+	private setPainter(format: CellFormat | null): void {
+		this.painterSource = format;
+		this.ui.brush?.toggleClass('is-active', format !== null);
+	}
+
+	private mergeSelection(): void {
+		const hot = this.hot;
+		if (!hot) return;
+		const ranges = this.requireSelection();
+		if (ranges.length === 0) return;
+		const plugin = hot.getPlugin('mergeCells');
+		let merged = false;
+		for (const rg of ranges) {
+			if (rg.r1 === rg.r2 && rg.c1 === rg.c2) continue;
+			plugin.merge(rg.r1, rg.c1, rg.r2, rg.c2);
+			merged = true;
+		}
+		if (!merged) new Notice('Select at least two cells to merge.');
+		else hot.render();
+	}
+
+	private unmergeSelection(): void {
+		const hot = this.hot;
+		if (!hot) return;
+		const ranges = this.requireSelection();
+		if (ranges.length === 0) return;
+		const plugin = hot.getPlugin('mergeCells');
+		for (const rg of ranges) plugin.unmerge(rg.r1, rg.c1, rg.r2, rg.c2);
+		hot.render();
+	}
+
+	private undoRedo(action: 'undo' | 'redo'): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const plugin = hot.getPlugin('undoRedo') as unknown as {
+			undo(): void;
+			redo(): void;
+		};
+		if (action === 'undo') plugin.undo();
+		else plugin.redo();
+	}
+
+	private alterStructure(
+		action:
+			| 'insert_row_below'
+			| 'remove_row'
+			| 'insert_col_end'
+			| 'remove_col',
+	): void {
+		const hot = this.hot;
+		if (!hot) return;
+		const ranges = this.requireSelection();
+		const rg = ranges[0];
+		if (!rg) return;
+		switch (action) {
+			case 'insert_row_below':
+				hot.alter('insert_row_below', rg.r2, 1);
+				break;
+			case 'insert_col_end':
+				hot.alter('insert_col_end', rg.c2, 1);
+				break;
+			case 'remove_row':
+				hot.alter('remove_row', rg.r1, rg.r2 - rg.r1 + 1);
+				break;
+			case 'remove_col':
+				hot.alter('remove_col', rg.c1, rg.c2 - rg.c1 + 1);
+				break;
+		}
+	}
+
+	private toggleDirection(): void {
+		this.captureGridStateIfLive();
+		this.model.rtl = !this.model.rtl;
+		this.rebuildGrid();
+		this.markDirty();
+	}
+
+	/* ---------------- Zoom ---------------- */
+
+	/** Zoom scales widths, heights and fonts together; model values stay at 100%. */
+	private applyZoom(next: number): void {
+		const z = Math.min(
+			MAX_ZOOM,
+			Math.max(MIN_ZOOM, Math.round(next * 20) / 20),
+		);
+		if (z === this.zoom) return;
+		this.zoom = z;
+
+		const hot = this.hot;
+		if (hot && !hot.isDestroyed) {
+			const cols = hot.getPlugin('manualColumnResize') as unknown as {
+				setManualSize(c: number, w: number): void;
+			};
+			const rows = hot.getPlugin('manualRowResize') as unknown as {
+				setManualSize(r: number, h: number): void;
+			};
+			this.model.colWidths.forEach((w, i) => {
+				if (w) cols.setManualSize(i, Math.round(w * z));
+			});
+			this.model.rowHeights.forEach((h, i) => {
+				if (h) rows.setManualSize(i, Math.round(h * z));
+			});
+			hot.render();
+			hot.refreshDimensions();
+		}
+		this.ui.zoomLabel?.setText(`${Math.round(z * 100)}%`);
+	}
+
+	/* ---------------- Manual sizes ---------------- */
+
+	/**
+	 * "Widen column" cells: the column is as wide as the widest of those cells needs, and goes
+	 * back to the width it had before as soon as no cell needs the extra room (a different
+	 * mode, shorter text or a smaller font). A width the user set by dragging is never undone.
+	 */
+	private fitExpandColumns(cols: Iterable<number>): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const records = (this.model.widenRecords ??= {});
+		const rows = hot.countRows();
+		let changed = false;
+
+		for (const col of new Set(cols)) {
+			let needed = 0;
+			let any = false;
+			for (let r = 0; r < rows; r++) {
+				const f = this.model.cellFormats[key(r, col)];
+				if (
+					f?.wrap !== 'expand' ||
+					f.rotate ||
+					this.model.images[key(r, col)]
+				)
+					continue;
+				any = true;
+				const display = this.resolveRaw(
+					hot.getSourceDataAtCell(r, col),
+					0,
+					false,
+				);
+				if (display === null || display === '') continue;
+				const text =
+					typeof display === 'boolean'
+						? display
+							? 'TRUE'
+							: 'FALSE'
+						: String(display);
+				needed = Math.max(
+					needed,
+					this.measureTextWidth(text, f) + EXPAND_PADDING,
+				);
+			}
+			needed = Math.min(Math.ceil(needed), MAX_EXPAND_WIDTH);
+
+			const colKey = String(col);
+			const stored = this.model.colWidths[col] ?? null;
+			const current = stored || DEFAULT_COL_WIDTH;
+			let rec = records[colKey];
+			if (rec && stored !== rec.w) {
+				delete records[colKey]; // the user resized the column: forget the old width
+				rec = undefined;
+			}
+
+			if (rec) {
+				const baseWidth = rec.prevW || DEFAULT_COL_WIDTH;
+				const target = any ? Math.max(baseWidth, needed) : baseWidth;
+				if (target === baseWidth) {
+					if (rec.prevW) this.setColumnWidth(col, rec.prevW);
+					else this.clearColumnWidth(col);
+					delete records[colKey];
+					changed = true;
+				} else if (target !== current) {
+					this.setColumnWidth(col, target);
+					rec.w = target;
+					changed = true;
+				}
+			} else if (any && needed > current) {
+				records[colKey] = { prevW: stored, w: needed };
+				this.setColumnWidth(col, needed);
+				changed = true;
+			}
+		}
+		if (changed) hot.render();
+	}
+
+	private setColumnWidth(col: number, width: number): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const plugin = hot.getPlugin('manualColumnResize') as unknown as {
+			setManualSize(column: number, width: number): void;
+		};
+		plugin.setManualSize(col, Math.round(width * this.zoom));
+		while (this.model.colWidths.length <= col)
+			this.model.colWidths.push(null);
+		this.model.colWidths[col] = width;
+	}
+
+	private setRowHeight(row: number, height: number): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const plugin = hot.getPlugin('manualRowResize') as unknown as {
+			setManualSize(row: number, height: number): void;
+		};
+		plugin.setManualSize(row, Math.round(height * this.zoom));
+		while (this.model.rowHeights.length <= row)
+			this.model.rowHeights.push(null);
+		this.model.rowHeights[row] = height;
+	}
+
+	/* ---------------- Images ---------------- */
+
+	private pickLocalFile(accept: string): Promise<File | null> {
+		return new Promise((resolve) => {
+			const input = activeDocument.createElement('input');
+			input.type = 'file';
+			input.accept = accept;
+			input.addClass('rtl-sheet-hidden');
+			const finish = (file: File | null): void => {
+				input.remove();
+				resolve(file);
+			};
+			input.addEventListener('change', () =>
+				finish(input.files?.[0] ?? null),
+			);
+			input.addEventListener('cancel', () => finish(null));
+			activeDocument.body.appendChild(input);
+			input.click();
+		});
+	}
+
+	private pickImageFromVault(): void {
+		if (!this.requireSelection()[0]) return;
+		new VaultFilePickerModal(
+			this.app,
+			IMAGE_EXTENSIONS,
+			'Choose an image from your vault…',
+			(file) => {
+				void this.setCellImage(file.path);
+			},
+		).open();
+	}
+
+	private async pickImageFromDevice(): Promise<void> {
+		if (!this.requireSelection()[0]) return;
+		const file = await this.pickLocalFile('image/*');
+		if (!file) return;
+		await this.addImageBlob(file, file.name);
+	}
+
+	private async pasteImageFromClipboard(): Promise<void> {
+		if (!this.requireSelection()[0]) return;
+		try {
+			const items = await navigator.clipboard.read();
+			for (const item of items) {
+				const type = item.types.find((t) => t.startsWith('image/'));
+				if (type) {
+					await this.addImageBlob(await item.getType(type), null);
+					return;
+				}
+			}
+			new Notice('The clipboard does not contain an image.');
+		} catch (e) {
+			this.plugin.reportError(
+				'Could not read an image from the clipboard',
+				e,
+			);
+		}
+	}
+
+	/** Saves image data as an attachment in the vault and places it in a cell. */
+	private async addImageBlob(
+		blob: Blob,
+		name: string | null,
+		target?: { row: number; col: number },
+	): Promise<void> {
+		const selected = this.getSelectedRanges()[0];
+		const cell =
+			target ??
+			(selected ? { row: selected.r1, col: selected.c1 } : null);
+		if (!cell) {
+			new Notice('Select a cell first.');
+			return;
+		}
+		try {
+			const subtype = (blob.type.split('/')[1] ?? 'png')
+				.replace('jpeg', 'jpg')
+				.replace('svg+xml', 'svg');
+			const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+			const fileName =
+				name && /\.[a-z0-9]+$/i.test(name)
+					? name
+					: `Pasted image ${stamp}.${subtype}`;
+			const path =
+				await this.app.fileManager.getAvailablePathForAttachment(
+					fileName,
+					this.file?.path ?? '',
+				);
+			await this.app.vault.createBinary(path, await blob.arrayBuffer());
+			await this.setCellImage(path, cell);
+		} catch (e) {
+			this.plugin.reportError('Could not add the image', e);
+		}
+	}
+
+	/** Ctrl+V / long-press paste of an image straight into the selected cell. */
+	private onPaste(e: ClipboardEvent): void {
+		const items = e.clipboardData?.items;
+		if (!items) return;
+		for (const item of Array.from(items)) {
+			if (item.kind === 'file' && item.type.startsWith('image/')) {
+				const blob = item.getAsFile();
+				if (!blob) continue;
+				e.preventDefault();
+				e.stopPropagation();
+				void this.addImageBlob(blob, null);
+				return;
+			}
+		}
+	}
+
+	private hasImageFile(e: DragEvent): boolean {
+		return Array.from(e.dataTransfer?.items ?? []).some(
+			(i) => i.kind === 'file' && i.type.startsWith('image/'),
+		);
+	}
+
+	/** Drop an image file from the file manager onto a cell. */
+	private onDrop(e: DragEvent): void {
+		const file = Array.from(e.dataTransfer?.files ?? []).find((f) =>
+			f.type.startsWith('image/'),
+		);
+		if (!file) return;
+		e.preventDefault();
+		const hot = this.hot;
+		const td =
+			e.target instanceof HTMLElement ? e.target.closest('td') : null;
+		let target: { row: number; col: number } | undefined;
+		if (hot && td) {
+			const coords = hot.getCoords(td);
+			const row = Number(coords?.row ?? -1);
+			const col = Number(coords?.col ?? -1);
+			if (row >= 0 && col >= 0) {
+				hot.selectCell(row, col);
+				target = { row, col };
+			}
+		}
+		void this.addImageBlob(file, file.name, target);
+	}
+
+	private async setCellImage(
+		path: string,
+		target?: { row: number; col: number },
+	): Promise<void> {
+		const hot = this.hot;
+		const selected = this.getSelectedRanges()[0];
+		const cell =
+			target ??
+			(selected ? { row: selected.r1, col: selected.c1 } : null);
+		if (!hot || !cell) {
+			new Notice('Select a cell first.');
+			return;
+		}
+		const k = key(cell.row, cell.col);
+		this.model.images[k] = path;
+		hot.render();
+		hot.selectCell(cell.row, cell.col);
+		hot.listen();
+		this.markDirty();
+
+		await this.fitCellToImage(cell.row, cell.col, path);
+		if (this.model.images[k] !== path || hot.isDestroyed) return; // removed in the meantime
+		this.invalidateRowSizes();
+		hot.render();
+		this.markDirty();
+	}
+
+	/** Resizes the cell's row and column so the image is shown at a comfortable size. */
+	private async fitCellToImage(
+		row: number,
+		col: number,
+		path: string,
+	): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return;
+		const url = this.app.vault.getResourcePath(file);
+		const dims = await new Promise<{ w: number; h: number } | null>(
+			(resolve) => {
+				const img = new Image();
+				img.onload = () =>
+					resolve({ w: img.naturalWidth, h: img.naturalHeight });
+				img.onerror = () => resolve(null);
+				img.src = url;
+			},
+		);
+		if (!dims || dims.w <= 0 || dims.h <= 0) return;
+		if (this.model.images[key(row, col)] !== path) return; // image was removed while loading
+		const scale = Math.min(
+			1,
+			MAX_IMAGE_CELL_PX / dims.w,
+			MAX_IMAGE_CELL_PX / dims.h,
+		);
+		const w = Math.max(60, Math.round(dims.w * scale));
+		const h = Math.max(30, Math.round(dims.h * scale));
+
+		// Remember the original size (only the first time) so deleting the image can restore it.
+		const k = key(row, col);
+		const existing = this.model.imageSizes[k];
+		this.model.imageSizes[k] = {
+			prevW: existing
+				? existing.prevW
+				: (this.model.colWidths[col] ?? null),
+			prevH: existing
+				? existing.prevH
+				: (this.model.rowHeights[row] ?? null),
+			w,
+			h,
+		};
+		this.setColumnWidth(col, w);
+		this.setRowHeight(row, h);
+	}
+
+	private clearColumnWidth(col: number): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const plugin = hot.getPlugin('manualColumnResize') as unknown as {
+			clearManualSize(column: number): void;
+		};
+		plugin.clearManualSize(col);
+		if (col < this.model.colWidths.length) this.model.colWidths[col] = null;
+	}
+
+	private clearRowHeight(row: number): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		// Unlike ManualColumnResize, ManualRowResize has no clearManualSize(); clear the
+		// stored value in its index map instead, and fall back to a normal row's height.
+		const plugin = hot.getPlugin('manualRowResize') as unknown as {
+			rowHeightsMap?: { clearValue?: (physicalIndex: number) => void };
+		};
+		const map = plugin.rowHeightsMap;
+		if (map && typeof map.clearValue === 'function') {
+			map.clearValue(hot.toPhysicalRow(row));
+		} else {
+			this.setRowHeight(row, this.normalRowHeight(row));
+		}
+		if (row < this.model.rowHeights.length)
+			this.model.rowHeights[row] = null;
+	}
+
+	/** Height of an ordinary row (no manual size, no image), used as a fallback default. */
+	private normalRowHeight(excludeRow: number): number {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return 28;
+		const limit = Math.min(hot.countRows(), 60);
+		for (let r = 0; r < limit; r++) {
+			if (r === excludeRow || this.model.rowHeights[r]) continue;
+			if (
+				Object.keys(this.model.images).some((k) =>
+					k.startsWith(`${r},`),
+				)
+			)
+				continue;
+			const h = hot.getRowHeight(r);
+			if (typeof h === 'number' && h > 0) return h;
+		}
+		return 28;
+	}
+
+	/** After an image is removed, give its row and column their old size back. */
+	private restoreImageCellSize(row: number, col: number): void {
+		const k = key(row, col);
+		const rec = this.model.imageSizes[k];
+		if (!rec) return;
+		delete this.model.imageSizes[k];
+
+		const others = Object.keys(this.model.images).map((imgKey) =>
+			imgKey.split(',').map(Number),
+		);
+		const columnStillHasImage = others.some((p) => p[1] === col);
+		const rowStillHasImage = others.some((p) => p[0] === row);
+
+		// Only restore a size that the image set; if the user resized the cell since, keep their size.
+		if (!columnStillHasImage && this.model.colWidths[col] === rec.w) {
+			if (rec.prevW) this.setColumnWidth(col, rec.prevW);
+			else this.clearColumnWidth(col);
+		}
+		if (!rowStillHasImage && this.model.rowHeights[row] === rec.h) {
+			if (rec.prevH) this.setRowHeight(row, rec.prevH);
+			else this.clearRowHeight(row);
+		}
+	}
+
+	/** Removes the images in the given ranges and returns how many were removed. */
+	private removeImagesInRanges(ranges: SelRange[]): number {
+		let removed = 0;
+		for (const rg of ranges) {
+			for (let r = rg.r1; r <= rg.r2; r++) {
+				for (let c = rg.c1; c <= rg.c2; c++) {
+					if (this.model.images[key(r, c)]) {
+						delete this.model.images[key(r, c)];
+						this.restoreImageCellSize(r, c);
+						removed++;
+					}
+				}
+			}
+		}
+		return removed;
+	}
+
+	private removeImages(): void {
+		const ranges = this.requireSelection();
+		const hot = this.hot;
+		if (ranges.length === 0 || !hot) return;
+		if (this.removeImagesInRanges(ranges) === 0) {
+			new Notice('There is no image in the selected cells.');
+			return;
+		}
+		this.invalidateRowSizes();
+		hot.render();
+		this.markDirty();
+	}
+
+	/** Delete / Backspace on a selected cell also removes its image. */
+	private onBeforeKeyDown(e: KeyboardEvent): void {
+		if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const editor = hot.getActiveEditor() as unknown as
+			| { isOpened?: () => boolean }
+			| undefined;
+		if (editor?.isOpened?.()) return; // the user is editing text, not clearing cells
+		try {
+			if (this.removeImagesInRanges(this.getSelectedRanges()) > 0) {
+				this.invalidateRowSizes();
+				hot.render();
+				this.markDirty();
+			}
+		} catch (err) {
+			this.plugin.reportError('Could not remove the image', err);
+		}
+	}
+
+	/* ---------------- Import ---------------- */
+
+	private async importFromDevice(): Promise<void> {
+		const file = await this.pickLocalFile(
+			'.xlsx,.xlsm,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+		);
+		if (!file) return;
+		await this.importBuffer(file.name, await file.arrayBuffer());
+	}
+
+	private importFromVault(): void {
+		new VaultFilePickerModal(
+			this.app,
+			['xlsx', 'xlsm', 'csv'],
+			'Choose a spreadsheet to import…',
+			(file) => {
+				void (async () => {
+					try {
+						await this.importBuffer(
+							file.name,
+							await this.app.vault.readBinary(file),
+						);
+					} catch (e) {
+						this.plugin.reportError('Import failed', e);
+					}
+				})();
+			},
+		).open();
+	}
+
+	private askImportDirection(
+		detectedRtl: boolean,
+	): Promise<ImportDirectionChoice | null> {
+		return new Promise((resolve) => {
+			new ImportDirectionModal(this.app, detectedRtl, resolve).open();
+		});
+	}
+
+	private async importBuffer(name: string, data: ArrayBuffer): Promise<void> {
+		try {
+			const ext = name.split('.').pop()?.toLowerCase() ?? '';
+			const imported =
+				ext === 'csv'
+					? parseCsv(decodeText(data))
+					: await parseXlsx(data);
+
+			const choice = await this.askImportDirection(imported.rtl);
+			if (choice === null) return; // dialog dismissed: cancel the import
+			if (choice !== 'keep') {
+				const wantRtl = choice === 'rtl';
+				if (wantRtl !== this.model.rtl) {
+					this.captureGridStateIfLive();
+					this.model.rtl = wantRtl;
+					this.rebuildGrid();
+				}
+			}
+			this.applyImported(imported);
+		} catch (e) {
+			this.plugin.reportError('Import failed', e);
+		}
+	}
+
+	/** Writes imported data into this sheet, starting at the selected cell (or A1). */
+	private applyImported(imp: ImportedSheet): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const rows = imp.data.length;
+		const cols = Math.max(0, ...imp.data.map((r) => r.length));
+		if (rows === 0 || cols === 0) {
+			new Notice('Nothing to import.');
+			return;
+		}
+
+		const anchor = this.getSelectedRanges()[0];
+		const ar = anchor?.r1 ?? 0;
+		const ac = anchor?.c1 ?? 0;
+
+		const missingRows = ar + rows - hot.countRows();
+		if (missingRows > 0)
+			hot.alter('insert_row_below', hot.countRows() - 1, missingRows);
+		const missingCols = ac + cols - hot.countCols();
+		if (missingCols > 0)
+			hot.alter('insert_col_end', hot.countCols() - 1, missingCols);
+
+		hot.populateFromArray(ar, ac, imp.data as unknown[][]);
+
+		for (const [k, f] of Object.entries(imp.formats)) {
+			const parts = k.split(',').map(Number);
+			const r = parts[0] ?? 0;
+			const c = parts[1] ?? 0;
+			this.model.cellFormats[key(r + ar, c + ac)] = f;
+		}
+
+		const mergePlugin = hot.getPlugin('mergeCells');
+		for (const mg of imp.merges) {
+			mergePlugin.merge(
+				mg.row + ar,
+				mg.col + ac,
+				mg.row + mg.rowspan - 1 + ar,
+				mg.col + mg.colspan - 1 + ac,
+			);
+		}
+		imp.colWidths.forEach((w, i) => {
+			if (w) this.setColumnWidth(i + ac, w);
+		});
+		imp.rowHeights.forEach((h, i) => {
+			if (h) this.setRowHeight(i + ar, h);
+		});
+
+		this.invalidateRowSizes();
+		hot.render();
+		this.markDirty();
+		new Notice(
+			`Imported ${rows} rows × ${cols} columns starting at ${indexToColumnLabel(ac)}${ar + 1}.`,
+		);
+	}
+
+	/* ---------------- Export ---------------- */
+
+	private toExcelValue(raw: unknown): ExcelJS.CellValue {
+		if (typeof raw === 'string') {
+			if (
+				this.plugin.settings.enableFormulas &&
+				raw.length > 1 &&
+				raw.startsWith('=')
+			) {
+				const result = this.resolveRaw(raw, 0, false);
+				return {
+					formula: normalizeSeparators(raw.slice(1)),
+					result: (result ??
+						undefined) as ExcelJS.CellFormulaValue['result'],
+				};
+			}
+			if (NUMERIC_RE.test(raw)) return Number(raw);
+			return raw;
+		}
+		if (typeof raw === 'number' || typeof raw === 'boolean') return raw;
+		return String(raw);
+	}
+
+	async exportToXlsx(): Promise<void> {
+		const file = this.file;
+		if (!file) {
+			new Notice('Open a sheet file before exporting.');
+			return;
+		}
+		try {
+			this.captureGridState();
+			const m = this.model;
+			const defaultSizePx = this.plugin.settings.defaultFontSize;
+
+			const wb = new ExcelJS.Workbook();
+			const ws = wb.addWorksheet(sanitizeSheetName(file.basename), {
+				views: [{ rightToLeft: m.rtl }],
+			});
+
+			m.data.forEach((rowArr, r) => {
+				rowArr.forEach((raw, c) => {
+					const f = m.cellFormats[key(r, c)];
+					const hasValue =
+						raw !== null && raw !== undefined && raw !== '';
+					if (!hasValue && !f) return;
+
+					const cell = ws.getCell(r + 1, c + 1);
+					let isNumber = false;
+					if (hasValue) {
+						const value = this.toExcelValue(raw);
+						cell.value = value;
+						isNumber =
+							typeof value === 'number' ||
+							(typeof value === 'object' &&
+								value !== null &&
+								'formula' in value &&
+								typeof (value as ExcelJS.CellFormulaValue)
+									.result === 'number');
+					}
+
+					cell.font = {
+						size:
+							Math.round(
+								(f?.fontSize ?? defaultSizePx) * 0.75 * 2,
+							) / 2,
+						bold: !!f?.bold,
+						italic: !!f?.italic,
+						underline: !!f?.underline,
+						strike: !!f?.strike,
+						...(f?.textColor
+							? { color: { argb: toArgb(f.textColor) } }
+							: {}),
+					};
+					cell.alignment = {
+						horizontal:
+							f?.align ?? (m.rtl || isNumber ? 'right' : 'left'),
+						vertical: f?.valign ?? 'middle',
+						readingOrder: m.rtl ? 'rtl' : 'ltr',
+						wrapText: f?.wrap === 'wrap',
+						...(f?.rotate
+							? { textRotation: rotationToExcel(f.rotate) }
+							: {}),
+					};
+					if (f?.bgColor) {
+						cell.fill = {
+							type: 'pattern',
+							pattern: 'solid',
+							fgColor: { argb: toArgb(f.bgColor) },
+						};
+					}
+					if (f?.borders) {
+						const side: Partial<ExcelJS.Border> = {
+							style: 'thin',
+							color: {
+								argb: f.borders.color
+									? toArgb(f.borders.color)
+									: 'FF000000',
+							},
+						};
+						cell.border = {
+							top: f.borders.top ? side : undefined,
+							right: f.borders.right ? side : undefined,
+							bottom: f.borders.bottom ? side : undefined,
+							left: f.borders.left ? side : undefined,
+						};
+					}
+				});
+			});
+
+			m.colWidths.forEach((w, i) => {
+				if (w) ws.getColumn(i + 1).width = Math.max(2, w / 7);
+			});
+			m.rowHeights.forEach((h, i) => {
+				if (h) ws.getRow(i + 1).height = h * 0.75;
+			});
+			for (const mg of m.merges) {
+				ws.mergeCells(
+					mg.row + 1,
+					mg.col + 1,
+					mg.row + mg.rowspan,
+					mg.col + mg.colspan,
+				);
+			}
+
+			let skippedImages = 0;
+			for (const [k, path] of Object.entries(m.images)) {
+				const imageFile = this.app.vault.getAbstractFileByPath(path);
+				if (!(imageFile instanceof TFile)) {
+					skippedImages++;
+					continue;
+				}
+				const ext = imageFile.extension.toLowerCase();
+				const excelExt =
+					ext === 'png'
+						? 'png'
+						: ext === 'jpg' || ext === 'jpeg'
+							? 'jpeg'
+							: ext === 'gif'
+								? 'gif'
+								: null;
+				if (!excelExt) {
+					skippedImages++; // webp/svg are not supported inside .xlsx files
+					continue;
+				}
+				const parts = k.split(',').map(Number);
+				const r = parts[0] ?? 0;
+				const c = parts[1] ?? 0;
+				const bytes = await this.app.vault.readBinary(imageFile);
+				const imageId = wb.addImage({
+					buffer: bytes as unknown as ExcelJS.Buffer,
+					extension: excelExt,
+				});
+				ws.addImage(imageId, {
+					tl: { col: c, row: r },
+					br: { col: c + 1, row: r + 1 },
+					editAs: 'oneCell',
+				} as unknown as Parameters<ExcelJS.Worksheet['addImage']>[1]);
+			}
+
+			const buffer = await wb.xlsx.writeBuffer();
+			const bytes = new Uint8Array(buffer as ArrayBuffer);
+			const data = bytes.buffer as ArrayBuffer;
+
+			const path = normalizePath(
+				file.path.replace(/\.[^./\\]+$/, '') + '.xlsx',
+			);
+			const existing = this.app.vault.getAbstractFileByPath(path);
+			if (existing instanceof TFile)
+				await this.app.vault.modifyBinary(existing, data);
+			else await this.app.vault.createBinary(path, data);
+
+			new Notice(
+				skippedImages > 0
+					? `Exported to ${path} (${skippedImages} image(s) skipped: only png, jpg and gif are supported in .xlsx)`
+					: `Exported to ${path}`,
+			);
+		} catch (e) {
+			this.plugin.reportError('Excel export failed', e);
+		}
 	}
 }

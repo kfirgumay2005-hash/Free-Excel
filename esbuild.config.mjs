@@ -1,5 +1,6 @@
 import esbuild from 'esbuild';
 import process from 'process';
+import fs from 'node:fs';
 import { builtinModules } from 'node:module';
 
 const banner = `/*
@@ -10,12 +11,29 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = process.argv[2] === 'production';
 
+/**
+ * main.ts imports Handsontable's CSS and plugin.css, so esbuild emits them as
+ * main.css next to main.js. Obsidian only loads styles.css, so move it there
+ * after every build (also on each rebuild in watch mode).
+ */
+const cssToStyles = {
+	name: 'css-to-styles',
+	setup(build) {
+		build.onEnd(() => {
+			if (!fs.existsSync('main.css')) return;
+			fs.copyFileSync('main.css', 'styles.css');
+			fs.unlinkSync('main.css');
+		});
+	},
+};
+
 const context = await esbuild.context({
 	banner: {
 		js: banner,
 	},
 	entryPoints: ['src/main.ts'],
 	bundle: true,
+	platform: 'browser',
 	external: [
 		'obsidian',
 		'electron',
@@ -32,6 +50,16 @@ const context = await esbuild.context({
 		'@lezer/lr',
 		...builtinModules,
 	],
+	// Images/fonts referenced from Handsontable's CSS are inlined so styles.css is self-contained.
+	loader: {
+		'.png': 'dataurl',
+		'.svg': 'dataurl',
+		'.gif': 'dataurl',
+		'.woff': 'dataurl',
+		'.woff2': 'dataurl',
+		'.ttf': 'dataurl',
+	},
+	plugins: [cssToStyles],
 	format: 'cjs',
 	target: 'es2021',
 	logLevel: 'info',

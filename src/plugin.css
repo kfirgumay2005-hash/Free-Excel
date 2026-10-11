@@ -1,0 +1,214 @@
+/* Free-Excel - plugin styles.
+   Handsontable's own CSS is bundled by esbuild into main.css, together with this file,
+   and the build moves everything to styles.css. */
+
+.view-content.rtl-spreadsheet-view {
+	display: flex;
+	flex-direction: column;
+	padding: 0;
+	overflow: hidden;
+}
+
+.rtl-sheet-hidden {
+	display: none;
+}
+
+/* ---------- Formula bar ---------- */
+
+.rtl-spreadsheet-view .rtl-sheet-formula-bar {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 8px;
+	direction: ltr;
+	flex: 0 0 auto;
+	border-bottom: 1px solid var(--background-modifier-border);
+	background: var(--background-primary);
+}
+
+.rtl-spreadsheet-view .rtl-sheet-address {
+	min-width: 52px;
+	padding: 2px 6px;
+	text-align: center;
+	font-size: var(--font-ui-small);
+	color: var(--text-muted);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+}
+
+.rtl-spreadsheet-view .rtl-sheet-formula-input {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+/* ---------- Toolbar ---------- */
+
+.rtl-spreadsheet-view .rtl-sheet-toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	padding: 4px 8px;
+	direction: ltr;
+	flex: 0 0 auto;
+	border-bottom: 1px solid var(--background-modifier-border);
+	background: var(--background-primary);
+}
+
+.rtl-spreadsheet-view .rtl-sheet-toolbar-group {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	flex: 0 0 auto;
+	padding-inline-end: 6px;
+	border-inline-end: 1px solid var(--background-modifier-border);
+}
+
+.rtl-spreadsheet-view .rtl-sheet-btn {
+	flex: 0 0 auto;
+	padding: var(--size-4-1) var(--size-4-2);
+	box-shadow: none;
+	background: transparent;
+}
+
+.rtl-spreadsheet-view .rtl-sheet-btn:hover {
+	background: var(--background-modifier-hover);
+}
+
+.rtl-spreadsheet-view .rtl-sheet-btn.is-active {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.rtl-spreadsheet-view .rtl-sheet-color {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	font-size: var(--font-ui-smaller);
+}
+
+.rtl-spreadsheet-view .rtl-sheet-select {
+	max-width: 120px;
+}
+
+/* ---------- Grid container ---------- */
+
+.rtl-spreadsheet-view .rtl-sheet-grid {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow: hidden;
+	position: relative;
+	/* Panning is native; pinch-zoom is handled by the plugin (it zooms the sheet, not the page). */
+	touch-action: pan-x pan-y;
+	overscroll-behavior: contain;
+}
+
+/* Covers the vertical grid lines that spilled text crosses (it sits behind the text). */
+.rtl-sheet-spill-eraser {
+	position: absolute;
+	top: 0;
+	bottom: 1px;
+	width: 3px;
+	z-index: -1;
+	pointer-events: none;
+}
+
+.rtl-sheet-import-choices {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 12px;
+}
+
+.rtl-sheet-rotated {
+	display: inline-block;
+}
+
+/* The image fills its cell (or merged cells), so resizing the cell resizes the image. */
+.rtl-sheet-img {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	object-fit: contain;
+}
+
+/* ---------- Function autocomplete popup (attached to <body>) ---------- */
+
+.rtl-sheet-autocomplete {
+	position: fixed;
+	z-index: var(--layer-popover, 100);
+	overflow-y: auto;
+	direction: ltr;
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	box-shadow: var(--shadow-s);
+	-webkit-overflow-scrolling: touch;
+}
+
+.rtl-sheet-ac-item {
+	display: flex;
+	flex-direction: column;
+	padding: 6px 10px;
+	cursor: pointer;
+}
+
+.rtl-sheet-ac-item:hover,
+.rtl-sheet-ac-item.is-active {
+	background: var(--background-modifier-hover);
+}
+
+.rtl-sheet-ac-name {
+	font-weight: var(--font-semibold);
+	font-family: var(--font-monospace);
+}
+
+.rtl-sheet-ac-desc {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+}
+
+.rtl-sheet-fn-syntax {
+	font-family: var(--font-monospace);
+}
+
+/* ---------- Touch devices / Obsidian mobile ---------- */
+
+.rtl-spreadsheet-view.is-touch .rtl-sheet-toolbar {
+	flex-wrap: nowrap;
+	overflow-x: auto;
+	gap: 10px;
+	-webkit-overflow-scrolling: touch;
+}
+
+.rtl-spreadsheet-view.is-touch .rtl-sheet-toolbar-group {
+	gap: 4px;
+}
+
+.rtl-spreadsheet-view.is-touch .rtl-sheet-btn,
+.rtl-spreadsheet-view.is-touch .rtl-sheet-select,
+.rtl-spreadsheet-view.is-touch .rtl-sheet-color input[type='color'] {
+	min-width: 40px;
+	min-height: 40px;
+}
+
+/* 16px prevents iOS from zooming the page when a field is focused. */
+.rtl-spreadsheet-view.is-touch .rtl-sheet-formula-input,
+.rtl-spreadsheet-view.is-touch .rtl-sheet-select {
+	font-size: 16px;
+}
+
+.rtl-spreadsheet-view.is-touch .rtl-sheet-formula-input {
+	min-height: 40px;
+}
+
+.rtl-spreadsheet-view.is-touch .rtl-sheet-address {
+	min-height: 40px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.is-mobile .rtl-sheet-ac-item {
+	padding: 10px 12px;
+}
