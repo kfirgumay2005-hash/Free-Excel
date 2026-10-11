@@ -50,6 +50,7 @@ import {
 	buildFunctionCall,
 	evaluateFormula,
 	normalizeSeparators,
+	referenceSlot,
 } from './formulas';
 import { ImportedSheet, parseCsv, parseXlsx } from './xlsx';
 import {
@@ -348,6 +349,15 @@ export class SheetView extends TextFileView {
 	private formulaCell: { row: number; col: number } | null = null;
 	/** Cell that the formula bar was editing when it received focus. */
 	private formulaEditCell: { row: number; col: number } | null = null;
+	/** Reference that was put into the formula being typed by clicking (or dragging over) cells. */
+	private refPick: {
+		field: HTMLInputElement | HTMLTextAreaElement;
+		from: number;
+		to: number;
+		anchor: { row: number; col: number };
+		range: SelRange | null;
+	} | null = null;
+	private writingRefPick = false;
 	/** Formatting copied by the format painter; null when the painter is off. */
 	private painterSource: CellFormat | null = null;
 
@@ -404,6 +414,30 @@ export class SheetView extends TextFileView {
 			if (this.hasImageFile(e)) e.preventDefault();
 		});
 		this.registerDomEvent(this.gridEl, 'drop', (e) => this.onDrop(e));
+
+		// While a formula is typed, a press on a cell inserts its reference. Capture phase so
+		// Handsontable does not see the press (it would close the editor and move the selection).
+		this.registerDomEvent(
+			this.gridEl,
+			'mousedown',
+			(e) => this.onGridPress(e),
+			{ capture: true },
+		);
+		// A tap ends in a mousedown that is handled above; keep the touch itself away from
+		// Handsontable. Scrolling and pinching (two fingers) are not affected.
+		const keepTapForPick = (e: TouchEvent): void => {
+			const touches =
+				e.type === 'touchstart' ? e.touches : e.changedTouches;
+			if (touches.length === 1 && this.refPickTarget(e)) e.stopPropagation();
+		};
+		this.registerDomEvent(this.gridEl, 'touchstart', keepTapForPick, {
+			capture: true,
+			passive: true,
+		});
+		this.registerDomEvent(this.gridEl, 'touchend', keepTapForPick, {
+			capture: true,
+			passive: true,
+		});
 
 		// Pinch to zoom. Touches that start in the grid are not passed on to Obsidian, so
 		// dragging sideways scrolls the columns instead of opening the sidebar.
@@ -855,7 +889,13 @@ export class SheetView extends TextFileView {
 
 	/* ---------------- Formula resolution ---------------- */
 
-	private resolveRaw(raw: unknown, depth: number, coerce: boolean): Scalar {
+	/** `at` is the cell the value lives in (ROW() and COLUMN() without an argument report it). */
+	private resolveRaw(
+		raw: unknown,
+		depth: number,
+		coerce: boolean,
+		at?: { row: number; col: number },
+	): Scalar {
 		if (raw === undefined || raw === null) return null;
 		if (typeof raw === 'string') {
 			if (
@@ -864,15 +904,22 @@ export class SheetView extends TextFileView {
 				raw.startsWith('=')
 			) {
 				if (depth > 40) return '#CYCLE!';
-				return evaluateFormula(raw, (r, c) => {
-					const hot: Handsontable.Core | null =
-						this.gridForCalc ?? this.hot;
-					const cellRaw =
-						hot && !hot.isDestroyed
-							? hot.getSourceDataAtCell(r, c)
-							: null;
-					return this.resolveRaw(cellRaw, depth + 1, true);
-				});
+				return evaluateFormula(
+					raw,
+					(r, c) => {
+						const hot: Handsontable.Core | null =
+							this.gridForCalc ?? this.hot;
+						const cellRaw =
+							hot && !hot.isDestroyed
+								? hot.getSourceDataAtCell(r, c)
+								: null;
+						return this.resolveRaw(cellRaw, depth + 1, true, {
+							row: r,
+							col: c,
+						});
+					},
+					at,
+				);
 			}
 			if (coerce && NUMERIC_RE.test(raw)) return Number(raw);
 			return raw;
@@ -884,6 +931,7 @@ export class SheetView extends TextFileView {
 	/* ---------------- Grid lifecycle ---------------- */
 
 	destroyGrid(): void {
+		this.clearRefPick();
 		this.autocomplete.detach();
 		if (this.hot && !this.hot.isDestroyed) this.hot.destroy();
 		this.hot = null;
@@ -1137,6 +1185,7 @@ export class SheetView extends TextFileView {
 					hot.getSourceDataAtCell(row, col),
 					0,
 					false,
+					{ row, col },
 				);
 				const text = display === null ? '' : String(display);
 				if (text) {
@@ -1249,6 +1298,163 @@ export class SheetView extends TextFileView {
 		this.autocomplete.attach(textarea);
 	}
 
+	/* ---------------- Picking references with the mouse ---------------- */
+
+	/** The field a formula is being typed in (formula bar or cell editor) and the cell it belongs to. */
+	private activeFormulaField(): {
+		field: HTMLInputElement | HTMLTextAreaElement;
+		cell: { row: number; col: number } | null;
+	} | null {
+		const input = this.ui.formulaInput;
+		if (input && input.ownerDocument.activeElement === input)
+			return { field: input, cell: this.formulaEditCell };
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return null;
+		const editor = hot.getActiveEditor() as unknown as
+			| {
+					isOpened?: () => boolean;
+					TEXTAREA?: HTMLTextAreaElement;
+					row?: number;
+					col?: number;
+			  }
+			| undefined;
+		if (!editor?.isOpened?.() || !editor.TEXTAREA) return null;
+		return {
+			field: editor.TEXTAREA,
+			cell:
+				editor.row === undefined || editor.col === undefined
+					? null
+					: { row: editor.row, col: editor.col },
+		};
+	}
+
+	private cellFromEvent(e: Event): { row: number; col: number } | null {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return null;
+		const td = (e.target as Element | null)?.closest?.('td');
+		if (!td || !this.gridEl.contains(td)) return null;
+		const coords = hot.getCoords(td as HTMLTableCellElement);
+		const row = coords?.row ?? -1;
+		const col = coords?.col ?? -1;
+		return row < 0 || col < 0 ? null : { row, col };
+	}
+
+	/**
+	 * When a press on the grid should put a reference into the formula being typed: the cell
+	 * that was pressed, the field and the part of its text to replace. Null otherwise.
+	 */
+	private refPickTarget(e: Event): {
+		field: HTMLInputElement | HTMLTextAreaElement;
+		slot: { from: number; to: number };
+		cell: { row: number; col: number };
+	} | null {
+		if (!this.plugin.settings.enableFormulas) return null;
+		const cell = this.cellFromEvent(e);
+		const active = cell ? this.activeFormulaField() : null;
+		if (!cell || !active) return null;
+		// The cell being edited cannot refer to itself.
+		if (active.cell?.row === cell.row && active.cell.col === cell.col)
+			return null;
+		const { field } = active;
+		const caret = field.selectionStart ?? field.value.length;
+		const slot = referenceSlot(
+			field.value,
+			caret,
+			field.selectionEnd ?? caret,
+		);
+		return slot ? { field, slot, cell } : null;
+	}
+
+	private onGridPress(e: MouseEvent): void {
+		if (e.button !== 0) return;
+		const target = this.refPickTarget(e);
+		if (!target) return;
+		// Keep the focus (and the caret) in the field, and keep the press away from Handsontable.
+		e.preventDefault();
+		e.stopPropagation();
+
+		const { field, slot, cell } = target;
+		this.clearRefPick();
+		this.refPick = { field, ...slot, anchor: cell, range: null };
+		const el: HTMLElement = field;
+		el.addEventListener('input', this.onRefPickFieldInput);
+		el.addEventListener('keydown', this.onRefPickFieldKey);
+		el.addEventListener('blur', this.clearRefPick);
+		this.writePickedReference(cell);
+
+		// Dragging over more cells turns the reference into a range such as A1:B5.
+		const doc = field.ownerDocument;
+		const onMove = (ev: MouseEvent): void => {
+			const over = this.cellFromEvent(ev);
+			if (over) this.writePickedReference(over);
+		};
+		const onUp = (): void => {
+			doc.removeEventListener('mousemove', onMove, true);
+			doc.removeEventListener('mouseup', onUp, true);
+		};
+		doc.addEventListener('mousemove', onMove, true);
+		doc.addEventListener('mouseup', onUp, true);
+	}
+
+	/** Writes the reference from the pick's first cell to the given cell into the formula. */
+	private writePickedReference(to: { row: number; col: number }): void {
+		const pick = this.refPick;
+		if (!pick) return;
+		const range: SelRange = {
+			r1: Math.min(pick.anchor.row, to.row),
+			r2: Math.max(pick.anchor.row, to.row),
+			c1: Math.min(pick.anchor.col, to.col),
+			c2: Math.max(pick.anchor.col, to.col),
+		};
+		const old = pick.range;
+		if (
+			old &&
+			old.r1 === range.r1 &&
+			old.r2 === range.r2 &&
+			old.c1 === range.c1 &&
+			old.c2 === range.c2
+		)
+			return;
+		pick.range = range;
+
+		const first = `${indexToColumnLabel(range.c1)}${range.r1 + 1}`;
+		const last = `${indexToColumnLabel(range.c2)}${range.r2 + 1}`;
+		const text = first === last ? first : `${first}:${last}`;
+		const { field } = pick;
+		field.value = `${field.value.slice(0, pick.from)}${text}${field.value.slice(pick.to)}`;
+		pick.to = pick.from + text.length;
+		// The caret ends up right after the reference, so the next click replaces it.
+		field.setSelectionRange(pick.to, pick.to);
+		this.writingRefPick = true;
+		try {
+			field.dispatchEvent(new Event('input', { bubbles: true }));
+		} finally {
+			this.writingRefPick = false;
+		}
+		this.hot?.render(); // moves the highlight of the picked cells
+	}
+
+	private readonly onRefPickFieldInput = (): void => {
+		if (!this.writingRefPick) this.clearRefPick();
+	};
+
+	private readonly onRefPickFieldKey = (e: KeyboardEvent): void => {
+		if (e.key === 'Enter' || e.key === 'Escape' || e.key === 'Tab')
+			this.clearRefPick();
+	};
+
+	/** Forgets the picked reference and removes its highlight (the formula text stays). */
+	private readonly clearRefPick = (): void => {
+		const pick = this.refPick;
+		if (!pick) return;
+		this.refPick = null;
+		const el: HTMLElement = pick.field;
+		el.removeEventListener('input', this.onRefPickFieldInput);
+		el.removeEventListener('keydown', this.onRefPickFieldKey);
+		el.removeEventListener('blur', this.clearRefPick);
+		if (this.hot && !this.hot.isDestroyed) this.hot.render();
+	};
+
 	/* ---------------- Renderer ---------------- */
 
 	private readonly cellRenderer = (
@@ -1262,7 +1468,7 @@ export class SheetView extends TextFileView {
 	): void => {
 		this.gridForCalc = instance;
 
-		const display = this.resolveRaw(value, 0, false);
+		const display = this.resolveRaw(value, 0, false, { row, col });
 		const isNumber =
 			typeof display === 'number' ||
 			(typeof display === 'string' && NUMERIC_RE.test(display));
@@ -1278,6 +1484,15 @@ export class SheetView extends TextFileView {
 		baseTextRenderer(instance, td, row, col, prop, text, cellProperties);
 		// Image cells are read-only, but they should not be greyed out like other read-only cells.
 		td.classList.remove('htDimmed', 'rtl-sheet-img-cell');
+		const picked = this.refPick?.range;
+		td.classList.toggle(
+			'rtl-sheet-ref-pick',
+			!!picked &&
+				row >= picked.r1 &&
+				row <= picked.r2 &&
+				col >= picked.c1 &&
+				col <= picked.c2,
+		);
 		td.querySelectorAll('.rtl-sheet-spill-eraser').forEach((el) =>
 			el.remove(),
 		);
@@ -1304,8 +1519,11 @@ export class SheetView extends TextFileView {
 		st.textAlign =
 			f?.align ?? (isNumber ? 'right' : rtl ? 'right' : 'left');
 		st.verticalAlign = f?.valign ?? '';
-		st.direction = rtl && isNumber ? 'ltr' : '';
-		st.unicodeBidi = rtl && !isNumber ? 'plaintext' : '';
+		// The text direction follows the content (numbers such as -5 read left-to-right). Never set
+		// `direction` on the cell: the grid line is the cell's inline-end border, so it would move
+		// to the other side and leave a gap next to every number in a right-to-left sheet.
+		st.direction = '';
+		st.unicodeBidi = rtl ? 'plaintext' : '';
 		st.whiteSpace = wrap === 'wrap' ? 'pre-wrap' : 'nowrap';
 		st.wordBreak = wrap === 'wrap' ? 'break-word' : '';
 		st.overflow = '';
@@ -2041,6 +2259,7 @@ export class SheetView extends TextFileView {
 	}
 
 	private onSelectionChanged(): void {
+		this.clearRefPick();
 		const first = this.getSelectedRanges()[0];
 		this.formulaCell = first ? { row: first.r1, col: first.c1 } : null;
 
@@ -2391,6 +2610,7 @@ export class SheetView extends TextFileView {
 					hot.getSourceDataAtCell(r, col),
 					0,
 					false,
+					{ row: r, col },
 				);
 				if (display === null || display === '') continue;
 				const text =
@@ -2914,14 +3134,14 @@ export class SheetView extends TextFileView {
 
 	/* ---------------- Export ---------------- */
 
-	private toExcelValue(raw: unknown): ExcelJS.CellValue {
+	private toExcelValue(raw: unknown, row: number, col: number): ExcelJS.CellValue {
 		if (typeof raw === 'string') {
 			if (
 				this.plugin.settings.enableFormulas &&
 				raw.length > 1 &&
 				raw.startsWith('=')
 			) {
-				const result = this.resolveRaw(raw, 0, false);
+				const result = this.resolveRaw(raw, 0, false, { row, col });
 				return {
 					formula: normalizeSeparators(raw.slice(1)),
 					result: (result ??
@@ -2961,7 +3181,7 @@ export class SheetView extends TextFileView {
 					const cell = ws.getCell(r + 1, c + 1);
 					let isNumber = false;
 					if (hasValue) {
-						const value = this.toExcelValue(raw);
+						const value = this.toExcelValue(raw, r, c);
 						cell.value = value;
 						isNumber =
 							typeof value === 'number' ||

@@ -1,4 +1,5 @@
 import FormulaParser from 'fast-formula-parser';
+import { Infix, Postfix } from 'fast-formula-parser/formulas/operators';
 import type { Scalar } from './model';
 
 /* ------------------------------------------------------------------ */
@@ -40,26 +41,557 @@ function roundResult(v: Scalar): Scalar {
 		: v;
 }
 
-function evaluateWithLibrary(formula: string, getCell: GetCell): Scalar {
-	const FP = FormulaParser as unknown as new (options: unknown) => {
-		parse(formula: string, position: unknown): unknown;
+/* ------------------------------------------------------------------ */
+/* Fixes and additions to fast-formula-parser                           */
+/* ------------------------------------------------------------------ */
+/*
+ * The library leaves out some everyday functions (they are added in EXTRA_FUNCTIONS) and
+ * mishandles empty cells: an empty cell passed to a text function became the text
+ * "[object Object]" (so LEN of an empty cell was 15), IF(A1, …) was always true, and an
+ * empty cell was never equal to "". patchLibrary fixes those in place, once.
+ */
+
+/** An argument as the library hands it to a function. */
+interface Arg {
+	value?: unknown;
+	isArray?: boolean;
+	isRangeRef?: boolean;
+	isCellRef?: boolean;
+}
+type LibFunction = (...args: (Arg | undefined)[]) => unknown;
+
+interface LibError {
+	error: string;
+}
+const LibFormulaError = FormulaParser.FormulaError as unknown as {
+	new (error: string): LibError;
+	DIV0: LibError;
+	NA: LibError;
+	REF: LibError;
+	NUM: LibError;
+	VALUE: LibError;
+};
+
+/** Cells hold errors as text such as "#DIV/0!"; the library needs its own error objects to pass them on. */
+function toLibValue(v: Scalar): unknown {
+	if (v === null) return undefined;
+	return typeof v === 'string' && ERR_RE.test(v) ? new LibFormulaError(v) : v;
+}
+
+/** All values of an argument. An error in any of them is thrown, unless `keepErrors` is set. */
+function argValues(arg: Arg | undefined, keepErrors = false): unknown[] {
+	if (!arg) throw LibFormulaError.VALUE;
+	const v = arg.value;
+	const values: unknown[] = Array.isArray(v) ? v.flat(Infinity) : [v];
+	if (!keepErrors)
+		for (const x of values) if (x instanceof LibFormulaError) throw x;
+	return values;
+}
+
+/** The numbers at the given positions; an error there is thrown, anything else is skipped. */
+function numbersAt(values: unknown[], indexes: number[]): number[] {
+	const out: number[] = [];
+	for (const index of indexes) {
+		const v = values[index];
+		if (v instanceof LibFormulaError) throw v;
+		if (typeof v === 'number') out.push(v);
+	}
+	return out;
+}
+
+const isBlank = (v: unknown): boolean =>
+	v === null || v === undefined || v === '';
+
+/** First value of an argument (a range gives its top-left cell). */
+function argScalar(arg: Arg | undefined): unknown {
+	return argValues(arg)[0];
+}
+
+function argText(arg: Arg | undefined): string {
+	const v = argScalar(arg);
+	if (v === null || v === undefined) return '';
+	if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+	return String(v as string | number);
+}
+
+function argNumber(arg: Arg | undefined): number {
+	const v = argScalar(arg);
+	if (isBlank(v)) return 0;
+	if (typeof v === 'number') return v;
+	if (typeof v === 'boolean') return Number(v);
+	const n = Number(v);
+	if (Number.isNaN(n)) throw LibFormulaError.VALUE;
+	return n;
+}
+
+/** The numbers in the arguments. Like Excel, text, booleans and empty cells inside references are skipped. */
+function argNumbers(args: (Arg | undefined)[]): number[] {
+	const out: number[] = [];
+	for (const arg of args) {
+		const fromCells = !!(arg?.isRangeRef || arg?.isCellRef || arg?.isArray);
+		for (const v of argValues(arg)) {
+			if (typeof v === 'number') out.push(v);
+			else if (fromCells || isBlank(v)) continue;
+			else if (typeof v === 'boolean') out.push(Number(v));
+			else if (!Number.isNaN(Number(v))) out.push(Number(v));
+			else throw LibFormulaError.VALUE;
+		}
+	}
+	return out;
+}
+
+const sameValue = (a: unknown, b: unknown): boolean =>
+	typeof a === 'string' && typeof b === 'string'
+		? a.toLowerCase() === b.toLowerCase()
+		: a === b;
+
+/** Turns "a*" or "?b" into a case-insensitive test of the whole text ("*" and "?" are wildcards). */
+function wildcardRegExp(pattern: string): RegExp {
+	const source = pattern
+		.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+		.replace(/\*/g, '[^]*')
+		.replace(/\?/g, '[^]');
+	return new RegExp(`^${source}$`, 'i');
+}
+
+/** A SUMIFS / COUNTIFS condition such as ">5", "<>done", "a*" or 7. */
+function criteriaTest(criteria: unknown): (v: unknown) => boolean {
+	if (typeof criteria !== 'string')
+		return (v) => (isBlank(criteria) ? isBlank(v) : v === criteria);
+	const m = /^(<=|>=|<>|<|>|=)?([^]*)$/.exec(criteria);
+	const op = m?.[1] ?? '=';
+	const rhs = m?.[2] ?? '';
+	const compare = (a: number | string, b: number | string): boolean =>
+		op === '<' ? a < b : op === '>' ? a > b : op === '<=' ? a <= b : a >= b;
+
+	if (rhs.trim() !== '' && !Number.isNaN(Number(rhs))) {
+		const n = Number(rhs);
+		if (op === '=') return (v) => v === n;
+		if (op === '<>') return (v) => v !== n;
+		return (v) => typeof v === 'number' && compare(v, n);
+	}
+	if (op === '=' || op === '<>') {
+		const re = wildcardRegExp(rhs);
+		return (v) =>
+			(isBlank(v) ? rhs === '' : re.test(String(v as string | number))) ===
+			(op === '=');
+	}
+	const text = rhs.toLowerCase();
+	return (v) => typeof v === 'string' && compare(v.toLowerCase(), text);
+}
+
+/** Rows (as indexes into the flattened ranges) that satisfy every range/criteria pair. */
+function matchingIndexes(pairs: (Arg | undefined)[]): number[] {
+	if (pairs.length === 0 || pairs.length % 2 !== 0) throw LibFormulaError.VALUE;
+	let indexes: number[] | null = null;
+	for (let p = 0; p < pairs.length; p += 2) {
+		const values = argValues(pairs[p], true);
+		const test = criteriaTest(argScalar(pairs[p + 1]));
+		const all: number[] = indexes ?? values.map((_, index) => index);
+		indexes = all.filter((index) => test(values[index]));
+	}
+	return indexes ?? [];
+}
+
+function variance(args: (Arg | undefined)[]): number {
+	const n = argNumbers(args);
+	if (n.length < 2) throw LibFormulaError.DIV0;
+	const mean = n.reduce((a, b) => a + b, 0) / n.length;
+	return n.reduce((a, b) => a + (b - mean) ** 2, 0) / (n.length - 1);
+}
+
+/** The k-th value (1-based) of the sorted numbers. */
+function kth(args: (Arg | undefined)[], descending: boolean): number {
+	const n = argNumbers([args[0]]).sort((a, b) => a - b);
+	if (descending) n.reverse();
+	const picked = n[Math.trunc(argNumber(args[1])) - 1];
+	if (picked === undefined) throw LibFormulaError.NUM;
+	return picked;
+}
+
+/** Rounds to a number of decimal digits: half away from zero, or always away from / toward zero. */
+function roundTo(
+	number: Arg | undefined,
+	digits: Arg | undefined,
+	mode: 'half' | 'up' | 'down',
+): number {
+	const x = argNumber(number);
+	const factor = 10 ** Math.trunc(argNumber(digits));
+	// toPrecision removes binary noise, so 1.005 * 100 is 100.5 and not 100.49999999999999.
+	const scaled = Number((Math.abs(x) * factor).toPrecision(15));
+	const rounded =
+		mode === 'up'
+			? Math.ceil(scaled)
+			: mode === 'down'
+				? Math.floor(scaled)
+				: Math.round(scaled);
+	return (Math.sign(x) * rounded) / factor;
+}
+
+/**
+ * VLOOKUP (vertical) and HLOOKUP. The library's versions returned #REF! when the first
+ * result cell was empty, and the lookup key instead of the result past the end of the table.
+ */
+function lookup(args: (Arg | undefined)[], vertical: boolean): unknown {
+	const [value, table, indexArg, approximateArg] = args;
+	const raw = argScalar(value);
+	const wanted: unknown = isBlank(raw) ? 0 : raw;
+	const rows = table?.value;
+	if (!Array.isArray(rows) || !Array.isArray(rows[0]))
+		throw LibFormulaError.NA;
+	const grid = rows as unknown[][];
+	const index = Math.trunc(argNumber(indexArg));
+	if (index < 1) throw LibFormulaError.VALUE;
+	if (index > (vertical ? (grid[0]?.length ?? 0) : grid.length))
+		throw LibFormulaError.REF;
+	const approximate = approximateArg
+		? isTrue(argScalar(approximateArg))
+		: true;
+
+	const keys: unknown[] = vertical
+		? grid.map((row) => row[0])
+		: (grid[0] ?? []);
+	const fold = (v: unknown): unknown =>
+		typeof v === 'string' ? v.toLowerCase() : v;
+	const target = fold(wanted);
+	let found = -1;
+	if (approximate) {
+		// The keys are sorted: take the last one that is not above the value.
+		for (let i = 0; i < keys.length; i++) {
+			const k = fold(keys[i]);
+			if (isBlank(k) || typeof k !== typeof target) continue;
+			if ((k as number | string) > (target as number | string)) break;
+			found = i;
+		}
+	} else if (typeof wanted === 'string' && /[*?]/.test(wanted)) {
+		const re = wildcardRegExp(wanted);
+		found = keys.findIndex((k) => typeof k === 'string' && re.test(k));
+	} else {
+		found = keys.findIndex((k) => !isBlank(k) && fold(k) === target);
+	}
+	if (found < 0) throw LibFormulaError.NA;
+	const result: unknown = vertical
+		? grid[found]?.[index - 1]
+		: grid[index - 1]?.[found];
+	if (result instanceof LibFormulaError) throw result;
+	return result ?? 0;
+}
+
+/** The library's own functions, for the wrappers below that only correct a special case. */
+const LIBRARY_FUNCTIONS = new FormulaParser().functions;
+
+/**
+ * YEAR, MONTH and DAY of an empty cell (or 0): Excel calls that day 0 January 1900, the
+ * library answered 31 December 1899.
+ */
+function datePart(name: string, ofDayZero: number): LibFunction {
+	return (date) => {
+		const v = argScalar(date);
+		if (isBlank(v) || (typeof v === 'number' && Math.trunc(v) === 0))
+			return ofDayZero;
+		return LIBRARY_FUNCTIONS[name]?.(date);
 	};
-	const parser = new FP({
-		onCell: (ref: { row: number; col: number }) => {
-			const v = getCell(ref.row - 1, ref.col - 1);
-			return v === null ? undefined : v;
-		},
+}
+
+function isTrue(v: unknown): boolean {
+	if (isBlank(v)) return false;
+	if (typeof v === 'boolean') return v;
+	if (typeof v === 'number') return v !== 0;
+	const text = String(v as string).toUpperCase();
+	if (text === 'TRUE') return true;
+	if (text === 'FALSE') return false;
+	throw LibFormulaError.VALUE;
+}
+
+/** Functions the library lacks, or gets wrong for empty cells. */
+const EXTRA_FUNCTIONS: Record<string, LibFunction> = {
+	// The library's SUM skips an error in a cell instead of showing it.
+	SUM: (...args) => argNumbers(args).reduce((a, b) => a + b, 0),
+	// Excel gives 0 (the library gave 1) when there is no number to multiply.
+	PRODUCT: (...args) => {
+		const n = argNumbers(args);
+		return n.length ? n.reduce((a, b) => a * b, 1) : 0;
+	},
+	VLOOKUP: (...args) => lookup(args, true),
+	HLOOKUP: (...args) => lookup(args, false),
+	YEAR: datePart('YEAR', 1900),
+	MONTH: datePart('MONTH', 1),
+	DAY: datePart('DAY', 0),
+	// The library's ROUNDUP adds a step to numbers that are already round (5 became 6).
+	ROUND: (number, digits) => roundTo(number, digits, 'half'),
+	ROUNDUP: (number, digits) => roundTo(number, digits, 'up'),
+	ROUNDDOWN: (number, digits) => roundTo(number, digits, 'down'),
+	// Excel's TRIM also collapses repeated spaces between words.
+	TRIM: (text) => argText(text).trim().replace(/ {2,}/g, ' '),
+	// The library's SEARCH is case sensitive, which is what FIND is for.
+	SEARCH: (find, text, start) => {
+		const from = start ? Math.trunc(argNumber(start)) : 1;
+		if (from < 1) throw LibFormulaError.VALUE;
+		const at = argText(text)
+			.toLowerCase()
+			.indexOf(argText(find).toLowerCase(), from - 1);
+		if (at < 0) throw LibFormulaError.VALUE;
+		return at + 1;
+	},
+	AVERAGE: (...args) => {
+		const n = argNumbers(args);
+		if (n.length === 0) throw LibFormulaError.DIV0;
+		return n.reduce((a, b) => a + b, 0) / n.length;
+	},
+	COUNTA: (...args) =>
+		args.reduce(
+			(count, arg) =>
+				count + argValues(arg).filter((v) => !isBlank(v)).length,
+			0,
+		),
+	MIN: (...args) => {
+		const n = argNumbers(args);
+		return n.length ? Math.min(...n) : 0;
+	},
+	MAX: (...args) => {
+		const n = argNumbers(args);
+		return n.length ? Math.max(...n) : 0;
+	},
+	MEDIAN: (...args) => {
+		const n = argNumbers(args).sort((a, b) => a - b);
+		const mid = n.length >> 1;
+		const upper = n[mid];
+		if (upper === undefined) throw LibFormulaError.NUM;
+		return n.length % 2 ? upper : ((n[mid - 1] ?? upper) + upper) / 2;
+	},
+	LARGE: (...args) => kth(args, true),
+	SMALL: (...args) => kth(args, false),
+	VAR: (...args) => variance(args),
+	STDEV: (...args) => Math.sqrt(variance(args)),
+	SUMIFS: (sumRange, ...pairs) =>
+		numbersAt(argValues(sumRange, true), matchingIndexes(pairs)).reduce(
+			(a, b) => a + b,
+			0,
+		),
+	COUNTIFS: (...pairs) => matchingIndexes(pairs).length,
+	// The library's criteria are case sensitive ("b*" did not match "Banana").
+	COUNTIF: (range, criteria) => matchingIndexes([range, criteria]).length,
+	MATCH: (value, range, type) => {
+		const lookup = argScalar(value);
+		const values = argValues(range);
+		const mode = type ? argNumber(type) : 1;
+		let found = -1;
+		if (mode === 0) {
+			found = values.findIndex((v) => sameValue(v, lookup));
+		} else {
+			// 1: the last value that is not above the lookup; -1: the last that is not below it.
+			const key = typeof lookup === 'string' ? lookup.toLowerCase() : lookup;
+			values.forEach((v, index) => {
+				const x = typeof v === 'string' ? v.toLowerCase() : v;
+				if (typeof x !== typeof key || isBlank(x)) return;
+				const a = x as number | string;
+				const b = key as number | string;
+				if (mode > 0 ? a <= b : a >= b) found = index;
+			});
+		}
+		if (found < 0) throw LibFormulaError.NA;
+		return found + 1;
+	},
+	// The library calls CHOOSE and IF with the parser as the first argument.
+	CHOOSE: (_parser, index, ...values) => {
+		const i = Math.trunc(argNumber(index));
+		if (i < 1 || i > values.length) throw LibFormulaError.VALUE;
+		return argScalar(values[i - 1]) ?? 0;
+	},
+	UPPER: (text) => argText(text).toUpperCase(),
+	SUBSTITUTE: (text, oldText, newText, instance) => {
+		const source = argText(text);
+		const from = argText(oldText);
+		const to = argText(newText);
+		if (from === '') return source;
+		if (!instance) return source.split(from).join(to);
+		const nth = Math.trunc(argNumber(instance));
+		if (nth < 1) throw LibFormulaError.VALUE;
+		let at = -1;
+		for (let n = 0; n < nth; n++) {
+			at = source.indexOf(from, at + 1);
+			if (at < 0) return source;
+		}
+		return source.slice(0, at) + to + source.slice(at + from.length);
+	},
+	VALUE: (text) => {
+		const v = argScalar(text);
+		if (typeof v === 'number') return v;
+		const s = argText(text).trim().replace(/,/g, '');
+		const percent = s.endsWith('%');
+		const n = Number(percent ? s.slice(0, -1) : s);
+		if (Number.isNaN(n)) throw LibFormulaError.VALUE;
+		return percent ? n / 100 : n;
+	},
+	PMT: (rate, periods, presentValue, futureValue, type) => {
+		const r = argNumber(rate);
+		const n = argNumber(periods);
+		const pv = argNumber(presentValue);
+		const fv = futureValue ? argNumber(futureValue) : 0;
+		const atStart = type ? argNumber(type) !== 0 : false;
+		if (n === 0) throw LibFormulaError.NUM;
+		if (r === 0) return -(pv + fv) / n;
+		const growth = (1 + r) ** n;
+		return (
+			-(r * (pv * growth + fv)) / ((atStart ? 1 + r : 1) * (growth - 1))
+		);
+	},
+};
+
+/** The parser, as the library passes it to the functions that receive their arguments unread. */
+interface LibContext {
+	utils: { extractRefValue(v: unknown): { val: unknown; isArray: boolean } };
+}
+interface LibCell {
+	row: number;
+	col: number;
+}
+/** An unread argument: a reference to a cell or a range, or a plain value. */
+type RawArg =
+	{ ref?: Partial<LibCell> & { from?: LibCell; to?: LibCell } } | null | undefined;
+
+function readArg(context: LibContext, raw: unknown): Arg | undefined {
+	if (raw === undefined) return undefined;
+	const read = context.utils.extractRefValue(raw);
+	return { value: read.val, isArray: read.isArray, isRangeRef: true };
+}
+
+/**
+ * SUMIF and AVERAGEIF: the numbers to add are the cells of the sum range (which starts at
+ * its top-left cell and takes the shape of the criteria range) whose criteria cell matches.
+ */
+function conditionalNumbers(
+	context: LibContext,
+	range: unknown,
+	criteria: unknown,
+	sumRange: unknown,
+): number[] {
+	const tested = readArg(context, range);
+	const indexes = matchingIndexes([tested, readArg(context, criteria)]);
+	let source = tested;
+	const from = (range as RawArg)?.ref;
+	const to = (sumRange as RawArg)?.ref;
+	if (to) {
+		const start: Partial<LibCell> = to.from ?? to;
+		const height = from?.from && from.to ? from.to.row - from.from.row : 0;
+		const width = from?.from && from.to ? from.to.col - from.from.col : 0;
+		if (start.row === undefined || start.col === undefined)
+			throw LibFormulaError.VALUE;
+		source = readArg(context, {
+			ref: {
+				from: { row: start.row, col: start.col },
+				to: { row: start.row + height, col: start.col + width },
+			},
+		});
+	}
+	return numbersAt(argValues(source, true), indexes);
+}
+
+/** Functions the library calls with the parser first and the arguments unread. */
+const CONTEXT_FUNCTIONS: Record<
+	string,
+	(context: LibContext, ...args: unknown[]) => unknown
+> = {
+	// The library treated every reference in the condition as TRUE.
+	IF: (context, test, whenTrue, whenFalse) => {
+		if (test === undefined || whenTrue === undefined)
+			throw LibFormulaError.VALUE;
+		if (isTrue(argScalar(readArg(context, test)))) return whenTrue ?? 0;
+		return whenFalse === undefined ? false : (whenFalse ?? 0);
+	},
+	// The library's criteria are case sensitive ("b*" did not match "Banana").
+	SUMIF: (context, range, criteria, sumRange) =>
+		conditionalNumbers(context, range, criteria, sumRange).reduce(
+			(a, b) => a + b,
+			0,
+		),
+	AVERAGEIF: (context, range, criteria, averageRange) => {
+		const n = conditionalNumbers(context, range, criteria, averageRange);
+		if (n.length === 0) throw LibFormulaError.DIV0;
+		return n.reduce((a, b) => a + b, 0) / n.length;
+	},
+};
+
+let libraryPatched = false;
+
+function patchLibrary(): void {
+	if (libraryPatched) return;
+	libraryPatched = true;
+
+	// An empty cell is 0, "" or FALSE, depending on what the function asks for.
+	const helpers = FormulaParser.FormulaHelpers;
+	const types = FormulaParser.Types;
+	const accept = helpers.accept.bind(helpers);
+	helpers.accept = (param: unknown, type?: unknown, ...rest: unknown[]) => {
+		const kind = Array.isArray(type) ? (type[0] as unknown) : type;
+		if (
+			typeof param === 'object' &&
+			param !== null &&
+			!Array.isArray(param) &&
+			'isArray' in param &&
+			isBlank((param as Arg).value)
+		) {
+			if (kind === undefined || kind === null) return 0;
+			if (kind === types.STRING) return '';
+			if (kind === types.BOOLEAN) return false;
+			if (kind === types.NUMBER || kind === types.NUMBER_NO_BOOLEAN)
+				return 0;
+		}
+		return accept(param, type, ...rest);
+	};
+
+	// Comparisons: an empty cell equals "" and FALSE (it already equals 0), and text ignores case.
+	const compareOp = Infix.compareOp;
+	Infix.compareOp = (a, op, b, aIsArray, bIsArray) => {
+		if (!aIsArray && !bIsArray) {
+			const blankLike = (other: unknown): unknown =>
+				typeof other === 'string'
+					? ''
+					: typeof other === 'boolean'
+						? false
+						: 0;
+			if (a === null || a === undefined) a = blankLike(b);
+			if (b === null || b === undefined) b = blankLike(a);
+			if (typeof a === 'string' && typeof b === 'string') {
+				a = a.toLowerCase();
+				b = b.toLowerCase();
+			}
+		}
+		return compareOp(a, op, b, aIsArray, bIsArray);
+	};
+
+	// "=A1%" with an empty A1.
+	const percentOp = Postfix.percentOp;
+	Postfix.percentOp = (value, postfix, isArray) =>
+		percentOp(value ?? 0, postfix, isArray);
+}
+
+/** Where the formula lives (0-based); ROW() and COLUMN() without an argument report it. */
+export interface CellPosition {
+	row: number;
+	col: number;
+}
+
+function evaluateWithLibrary(
+	formula: string,
+	getCell: GetCell,
+	at?: CellPosition,
+): Scalar {
+	patchLibrary();
+	const parser = new FormulaParser({
+		functions: EXTRA_FUNCTIONS,
+		functionsNeedContext: CONTEXT_FUNCTIONS,
+		onCell: (ref: { row: number; col: number }) =>
+			toLibValue(getCell(ref.row - 1, ref.col - 1)),
 		onRange: (ref: {
 			from: { row: number; col: number };
 			to: { row: number; col: number };
 		}) => {
-			const rows: (Scalar | undefined)[][] = [];
+			const rows: unknown[][] = [];
 			for (let r = ref.from.row; r <= ref.to.row; r++) {
-				const row: (Scalar | undefined)[] = [];
-				for (let c = ref.from.col; c <= ref.to.col; c++) {
-					const v = getCell(r - 1, c - 1);
-					row.push(v === null ? undefined : v);
-				}
+				const row: unknown[] = [];
+				for (let c = ref.from.col; c <= ref.to.col; c++)
+					row.push(toLibValue(getCell(r - 1, c - 1)));
 				rows.push(row);
 			}
 			return rows;
@@ -70,8 +602,8 @@ function evaluateWithLibrary(formula: string, getCell: GetCell): Scalar {
 		normalizeSeparators(formula.replace(/^\s*=/, '')),
 		{
 			sheet: 'Sheet1',
-			row: 1,
-			col: 1,
+			row: (at?.row ?? 0) + 1,
+			col: (at?.col ?? 0) + 1,
 		},
 	);
 
@@ -367,9 +899,13 @@ function evaluateBuiltin(formula: string, getCell: GetCell): Scalar {
 	}
 }
 
-export function evaluateFormula(formula: string, getCell: GetCell): Scalar {
+export function evaluateFormula(
+	formula: string,
+	getCell: GetCell,
+	at?: CellPosition,
+): Scalar {
 	try {
-		return evaluateWithLibrary(formula, getCell);
+		return evaluateWithLibrary(formula, getCell, at);
 	} catch (e) {
 		console.debug(
 			'[Free-Excel] fast-formula-parser failed, using built-in evaluator',
@@ -560,6 +1096,62 @@ export const FORMULA_FUNCTIONS: FormulaFunctionInfo[] = [
 	fn('COLUMN', 'COLUMN([reference])', 'Column number of a reference'),
 	fn('PMT', 'PMT(rate, periods, present_value)', 'Loan payment per period'),
 ];
+
+/* ------------------------------------------------------------------ */
+/* Picking a reference by clicking a cell                               */
+/* ------------------------------------------------------------------ */
+
+const REFERENCE_SRC = '\\$?[A-Za-z]{1,3}\\$?\\d+(?::\\$?[A-Za-z]{1,3}\\$?\\d+)?';
+/**
+ * Strings, references (group 1), names (functions, TRUE/FALSE) and numbers. Names come
+ * before numbers, and a reference is not followed by "(", so LOG10(…) stays a name.
+ */
+const OPERAND_RE = new RegExp(
+	`"[^"]*"?|(${REFERENCE_SRC})(?![\\w.(])|[A-Za-z_][\\w.]*|\\d+(?:\\.\\d+)?`,
+	'g',
+);
+const LITERAL_RE = /^(?:"[^]*|\d+(?:\.\d+)?|TRUE|FALSE)$/i;
+const REFERENCE_EXPECTED_AFTER = /[=(,;+\-*/^&<>:]\s*$/;
+
+/**
+ * The part of a formula that a clicked cell should replace, or null when a click should
+ * not insert a reference. That is the selected text, the reference under the caret, a
+ * literal argument of a function under the caret (such as the 1 in "IF(A1>0, 1, 0)"), or
+ * the empty spot after "=", "(", "," or an operator.
+ */
+export function referenceSlot(
+	value: string,
+	start: number,
+	end: number,
+): { from: number; to: number } | null {
+	if (!value.startsWith('=') || start < 1) return null;
+	if (end > start) return { from: start, to: end };
+
+	let depth = 0;
+	let inString = false;
+	for (const ch of value.slice(0, start)) {
+		if (ch === '"') inString = !inString;
+		else if (!inString && ch === '(') depth++;
+		else if (!inString && ch === ')') depth--;
+	}
+
+	// Right after a separator the caret belongs to the argument that follows the spaces.
+	const afterSeparator = REFERENCE_EXPECTED_AFTER.test(value.slice(0, start));
+	let next = start;
+	if (afterSeparator) while (value[next] === ' ') next++;
+
+	for (const m of value.matchAll(OPERAND_RE)) {
+		const from = m.index ?? 0;
+		const to = from + m[0].length;
+		if (from > next) break;
+		if (to < start) continue;
+		if (m[1] !== undefined || (depth > 0 && LITERAL_RE.test(m[0])))
+			return { from, to };
+		if (from > start) break; // a name after the spaces: insert before it
+		return null;
+	}
+	return afterSeparator ? { from: start, to: start } : null;
+}
 
 /* ------------------------------------------------------------------ */
 /* Inserting a function with example arguments                          */

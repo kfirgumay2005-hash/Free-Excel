@@ -16,7 +16,31 @@ declare module 'fast-formula-parser' {
 	class FormulaParser {
 		constructor(config?: unknown);
 		parse(formula: string, position: FormulaPosition): unknown;
+		/** Every function the parser knows, by upper-case name. */
+		functions: Record<string, (...args: unknown[]) => unknown>;
+		/** Error class; `new FormulaError('#DIV/0!')` returns the shared instance for that error. */
+		static FormulaError: unknown;
+		static FormulaHelpers: {
+			accept(param: unknown, type?: unknown, ...rest: unknown[]): unknown;
+		};
+		static Types: Record<string, number>;
 	}
 
 	export default FormulaParser;
+}
+
+// The operator implementations, patched in formulas.ts for empty cells.
+declare module 'fast-formula-parser/formulas/operators' {
+	export const Infix: {
+		compareOp(
+			a: unknown,
+			op: string,
+			b: unknown,
+			aIsArray: boolean,
+			bIsArray: boolean,
+		): unknown;
+	};
+	export const Postfix: {
+		percentOp(value: unknown, postfix: string, isArray: boolean): unknown;
+	};
 }
