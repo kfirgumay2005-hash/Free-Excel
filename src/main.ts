@@ -26,6 +26,7 @@ import {
 	CellFormat,
 	DEFAULT_COL_WIDTH,
 	FONT_SIZES,
+	MergeInfo,
 	NUMERIC_RE,
 	ROTATIONS,
 	Scalar,
@@ -682,7 +683,7 @@ export class SheetView extends TextFileView {
 		) {
 			const width = Math.max(1, ...r.data.map((row) => row.length));
 			data = r.data.map((row) => {
-				const copy = row.slice() as Scalar[];
+				const copy = row.slice();
 				while (copy.length < width) copy.push(null);
 				return copy;
 			});
@@ -756,24 +757,40 @@ export class SheetView extends TextFileView {
 		const hot = this.hot;
 		if (!hot || hot.isDestroyed) return;
 		this.model.data = hot.getSourceDataArray() as Scalar[][];
-		// The merged-cells collection is not part of Handsontable's public typings.
-		const mc = hot.getPlugin('mergeCells') as unknown as {
-			mergedCellsCollection?: {
-				mergedCells?: {
-					row: number;
-					col: number;
-					rowspan: number;
-					colspan: number;
-				}[];
-			};
-		};
-		const merged = mc.mergedCellsCollection?.mergedCells ?? [];
-		this.model.merges = merged.map((m) => ({
+		this.model.merges = this.liveMerges(hot).map((m) => ({
 			row: m.row,
 			col: m.col,
 			rowspan: m.rowspan,
 			colspan: m.colspan,
 		}));
+	}
+
+	/** The grid's current merges, or the model's when there is no live grid. */
+	private liveMerges(hot: Handsontable.Core | null): MergeInfo[] {
+		if (!hot || hot.isDestroyed) return this.model.merges;
+		// The merged-cells collection is not part of Handsontable's public typings.
+		const mc = hot.getPlugin('mergeCells') as unknown as {
+			mergedCellsCollection?: { mergedCells?: MergeInfo[] };
+		};
+		return mc.mergedCellsCollection?.mergedCells ?? [];
+	}
+
+	/** The merge that covers a cell, if any. */
+	private mergeAt(
+		hot: Handsontable.Core | null,
+		row: number,
+		col: number,
+	): MergeInfo | null {
+		for (const m of this.liveMerges(hot)) {
+			if (
+				row >= m.row &&
+				row < m.row + m.rowspan &&
+				col >= m.col &&
+				col < m.col + m.colspan
+			)
+				return m;
+		}
+		return null;
 	}
 
 	private captureGridStateIfLive(): void {
@@ -1109,6 +1126,9 @@ export class SheetView extends TextFileView {
 		for (const col of cols) {
 			const f = this.model.cellFormats[key(row, col)];
 			if (!f) continue;
+			const mg = this.mergeAt(hot, row, col);
+			// Cells hidden inside a merge keep their format but show nothing.
+			if (mg && (mg.row !== row || mg.col !== col)) continue;
 			const size = f.fontSize ?? defaultSize;
 			let need = rowBaseHeight(size);
 			const vertical = f.rotate === 90 || f.rotate === -90;
@@ -1126,8 +1146,10 @@ export class SheetView extends TextFileView {
 							Math.ceil(this.measureTextWidth(text, f)) + 16,
 						);
 					} else {
-						const colWidth =
-							this.model.colWidths[col] || DEFAULT_COL_WIDTH;
+						let colWidth = 0;
+						for (let c = col; c < col + (mg?.colspan ?? 1); c++)
+							colWidth +=
+								this.model.colWidths[c] || DEFAULT_COL_WIDTH;
 						const lines = this.countWrappedLines(
 							text,
 							Math.max(20, colWidth - 2 * CELL_PADDING),
@@ -1140,6 +1162,12 @@ export class SheetView extends TextFileView {
 						);
 					}
 				}
+			}
+			// A merged cell also has the height of the other rows it covers.
+			if (mg) {
+				for (let r = mg.row + 1; r < mg.row + mg.rowspan; r++)
+					need -=
+						this.model.rowHeights[r] || rowBaseHeight(defaultSize);
 			}
 			height = Math.max(height, need);
 		}
@@ -1193,9 +1221,7 @@ export class SheetView extends TextFileView {
 	/** Width of text in unzoomed px. */
 	private measureTextWidth(text: string, f: CellFormat | undefined): number {
 		if (!this.measureCtx)
-			this.measureCtx = activeDocument
-				.createElement('canvas')
-				.getContext('2d');
+			this.measureCtx = createEl('canvas').getContext('2d');
 		const ctx = this.measureCtx;
 		if (!ctx) return 0;
 		const size = f?.fontSize ?? this.plugin.settings.defaultFontSize;
@@ -1251,7 +1277,7 @@ export class SheetView extends TextFileView {
 
 		baseTextRenderer(instance, td, row, col, prop, text, cellProperties);
 		// Image cells are read-only, but they should not be greyed out like other read-only cells.
-		td.classList.remove('htDimmed');
+		td.classList.remove('htDimmed', 'rtl-sheet-img-cell');
 		td.querySelectorAll('.rtl-sheet-spill-eraser').forEach((el) =>
 			el.remove(),
 		);
@@ -1332,9 +1358,12 @@ export class SheetView extends TextFileView {
 		isNumber: boolean,
 		f: CellFormat | undefined,
 	): { visualRight: boolean; extra: number; lines: number[] } | null {
-		if (!text || isNumber || f?.align === 'center') return null;
+		if (!text || isNumber) return null;
 
-		const own = hot.getColWidth(col);
+		// A merged cell is as wide as all the columns it covers.
+		const colspan = this.mergeAt(hot, row, col)?.colspan ?? 1;
+		let own = 0;
+		for (let c = col; c < col + colspan; c++) own += hot.getColWidth(c);
 		const needed =
 			this.measureTextWidth(text, f) * this.zoom + 2 * CELL_PADDING;
 		if (needed <= own) return null; // it fits: nothing crosses the cell border
@@ -1346,7 +1375,11 @@ export class SheetView extends TextFileView {
 		const lines: number[] = [own]; // the cell's own border is crossed
 		let reach = own;
 		let extra = 0;
-		for (let c = col + delta; c >= 0 && c < hot.countCols(); c += delta) {
+		for (
+			let c = delta > 0 ? col + colspan : col - 1;
+			c >= 0 && c < hot.countCols();
+			c += delta
+		) {
 			const raw: unknown = hot.getSourceDataAtCell(row, c);
 			if (
 				!(raw === null || raw === undefined || raw === '') ||
@@ -1370,12 +1403,12 @@ export class SheetView extends TextFileView {
 		td.textContent = '';
 		const span = td.createSpan({ cls: 'rtl-sheet-rotated', text });
 		if (rotate === 90) {
-			span.style.writingMode = 'vertical-rl';
-			span.style.transform = 'rotate(180deg)';
+			span.addClasses(['is-vertical', 'is-flipped']);
 		} else if (rotate === -90) {
-			span.style.writingMode = 'vertical-rl';
+			span.addClass('is-vertical');
 		} else {
-			span.style.transform = `rotate(${-rotate}deg)`;
+			span.addClass('is-angled');
+			span.setCssProps({ '--rtl-sheet-rotate': `${-rotate}deg` });
 		}
 	}
 
@@ -1386,7 +1419,7 @@ export class SheetView extends TextFileView {
 			td.setText('Missing image');
 			return;
 		}
-		td.style.position = 'relative';
+		td.addClass('rtl-sheet-img-cell');
 		td.createEl('img', {
 			cls: 'rtl-sheet-img',
 			attr: {
@@ -1448,7 +1481,7 @@ export class SheetView extends TextFileView {
 		const input = this.ui.formulaInput;
 		const cell = this.formulaEditCell ?? this.formulaCell;
 		if (!hot || hot.isDestroyed || !input || !cell) return;
-		const current = hot.getSourceDataAtCell(cell.row, cell.col) as unknown;
+		const current = hot.getSourceDataAtCell(cell.row, cell.col);
 		const currentText =
 			current === null || current === undefined ? '' : String(current);
 		if (input.value === currentText) return;
@@ -2034,7 +2067,7 @@ export class SheetView extends TextFileView {
 		if (!sel) return [];
 		return sel
 			.map((sel0) => {
-				const [a = 0, b = 0, c = 0, d = 0] = sel0 as number[];
+				const [a = 0, b = 0, c = 0, d = 0] = sel0;
 				return {
 					r1: Math.max(0, Math.min(a, c)),
 					c1: Math.max(0, Math.min(b, d)),
@@ -2196,11 +2229,45 @@ export class SheetView extends TextFileView {
 		let merged = false;
 		for (const rg of ranges) {
 			if (rg.r1 === rg.r2 && rg.c1 === rg.c2) continue;
+			this.keepMergeContent(hot, rg);
 			plugin.merge(rg.r1, rg.c1, rg.r2, rg.c2);
 			merged = true;
 		}
-		if (!merged) new Notice('Select at least two cells to merge.');
-		else hot.render();
+		if (!merged) {
+			new Notice('Select at least two cells to merge.');
+			return;
+		}
+		this.invalidateRowSizes();
+		hot.render();
+		this.markDirty();
+	}
+
+	/**
+	 * Handsontable keeps only the top-left value of a merge. Like Excel, keep the
+	 * first value in the range instead (moving it to the top-left cell) and
+	 * center the merged cell unless it already has an alignment.
+	 */
+	private keepMergeContent(hot: Handsontable.Core, rg: SelRange): void {
+		const isBlank = (v: unknown): boolean =>
+			v === null || v === undefined || v === '';
+		const anchor = key(rg.r1, rg.c1);
+		if (isBlank(hot.getSourceDataAtCell(rg.r1, rg.c1))) {
+			search: for (let r = rg.r1; r <= rg.r2; r++) {
+				for (let c = rg.c1; c <= rg.c2; c++) {
+					const value: unknown = hot.getSourceDataAtCell(r, c);
+					if (isBlank(value)) continue;
+					hot.setDataAtCell(rg.r1, rg.c1, value);
+					const f = this.model.cellFormats[key(r, c)];
+					if (f && !this.model.cellFormats[anchor])
+						this.model.cellFormats[anchor] = cloneFormat(f);
+					break search;
+				}
+			}
+		}
+		const f: CellFormat = { ...(this.model.cellFormats[anchor] ?? {}) };
+		f.align ??= 'center';
+		f.valign ??= 'middle';
+		this.model.cellFormats[anchor] = f;
 	}
 
 	private unmergeSelection(): void {
@@ -2210,6 +2277,7 @@ export class SheetView extends TextFileView {
 		if (ranges.length === 0) return;
 		const plugin = hot.getPlugin('mergeCells');
 		for (const rg of ranges) plugin.unmerge(rg.r1, rg.c1, rg.r2, rg.c2);
+		this.invalidateRowSizes();
 		hot.render();
 	}
 
@@ -2315,6 +2383,9 @@ export class SheetView extends TextFileView {
 					this.model.images[key(r, col)]
 				)
 					continue;
+				const mg = this.mergeAt(hot, r, col);
+				// Cells hidden inside a merge keep their format but show nothing.
+				if (mg && (mg.row !== r || mg.col !== col)) continue;
 				any = true;
 				const display = this.resolveRaw(
 					hot.getSourceDataAtCell(r, col),
@@ -2328,10 +2399,11 @@ export class SheetView extends TextFileView {
 							? 'TRUE'
 							: 'FALSE'
 						: String(display);
-				needed = Math.max(
-					needed,
-					this.measureTextWidth(text, f) + EXPAND_PADDING,
-				);
+				let width = this.measureTextWidth(text, f) + EXPAND_PADDING;
+				// A merged cell already has the width of the other columns it covers.
+				for (let c = col + 1; c < col + (mg?.colspan ?? 1); c++)
+					width -= this.model.colWidths[c] || DEFAULT_COL_WIDTH;
+				needed = Math.max(needed, width);
 			}
 			needed = Math.min(Math.ceil(needed), MAX_EXPAND_WIDTH);
 
@@ -2394,10 +2466,11 @@ export class SheetView extends TextFileView {
 
 	private pickLocalFile(accept: string): Promise<File | null> {
 		return new Promise((resolve) => {
-			const input = activeDocument.createElement('input');
-			input.type = 'file';
+			const input = activeDocument.body.createEl('input', {
+				type: 'file',
+				cls: 'rtl-sheet-hidden',
+			});
 			input.accept = accept;
-			input.addClass('rtl-sheet-hidden');
 			const finish = (file: File | null): void => {
 				input.remove();
 				resolve(file);
@@ -2406,7 +2479,6 @@ export class SheetView extends TextFileView {
 				finish(input.files?.[0] ?? null),
 			);
 			input.addEventListener('cancel', () => finish(null));
-			activeDocument.body.appendChild(input);
 			input.click();
 		});
 	}
@@ -2807,7 +2879,7 @@ export class SheetView extends TextFileView {
 		if (missingCols > 0)
 			hot.alter('insert_col_end', hot.countCols() - 1, missingCols);
 
-		hot.populateFromArray(ar, ac, imp.data as unknown[][]);
+		hot.populateFromArray(ar, ac, imp.data);
 
 		for (const [k, f] of Object.entries(imp.formats)) {
 			const parts = k.split(',').map(Number);
@@ -2989,7 +3061,7 @@ export class SheetView extends TextFileView {
 				const c = parts[1] ?? 0;
 				const bytes = await this.app.vault.readBinary(imageFile);
 				const imageId = wb.addImage({
-					buffer: bytes as unknown as ExcelJS.Buffer,
+					buffer: bytes,
 					extension: excelExt,
 				});
 				ws.addImage(imageId, {
@@ -3000,8 +3072,8 @@ export class SheetView extends TextFileView {
 			}
 
 			const buffer = await wb.xlsx.writeBuffer();
-			const bytes = new Uint8Array(buffer as ArrayBuffer);
-			const data = bytes.buffer as ArrayBuffer;
+			const bytes = new Uint8Array(buffer);
+			const data = bytes.buffer;
 
 			const path = normalizePath(
 				file.path.replace(/\.[^./\\]+$/, '') + '.xlsx',

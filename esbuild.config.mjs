@@ -27,6 +27,32 @@ const cssToStyles = {
 	},
 };
 
+/**
+ * ExcelJS's browser bundle ships setImmediate polyfills (from JSZip and core-js)
+ * whose legacy-IE fallback injects a <script> element. Obsidian always has
+ * MutationObserver and MessageChannel, so that branch can never run; turn its
+ * feature test into `false` so the minifier drops the dead code.
+ */
+const dropScriptPolyfill = {
+	name: 'drop-script-polyfill',
+	setup(build) {
+		build.onLoad({ filter: /exceljs[\\/]dist[\\/].*\.js$/ }, (args) => {
+			const source = fs.readFileSync(args.path, 'utf8');
+			const pattern =
+				/(?:"document"\s*in\s*[\w$]+\s*&&\s*|[\w$]+\s*&&\s*)"onreadystatechange"\s*in\s*[\w$.]+\.createElement\("script"\)/g;
+			return { contents: source.replace(pattern, 'false'), loader: 'js' };
+		});
+		// Dead-code removal only happens when minifying, so only check production builds.
+		build.onEnd(() => {
+			if (!prod || !fs.existsSync('main.js')) return;
+			if (/createElement\(["']script["']\)/.test(fs.readFileSync('main.js', 'utf8')))
+				throw new Error(
+					'drop-script-polyfill: main.js still creates script elements; update the pattern.',
+				);
+		});
+	},
+};
+
 const context = await esbuild.context({
 	banner: {
 		js: banner,
@@ -59,7 +85,7 @@ const context = await esbuild.context({
 		'.woff2': 'dataurl',
 		'.ttf': 'dataurl',
 	},
-	plugins: [cssToStyles],
+	plugins: [cssToStyles, dropScriptPolyfill],
 	format: 'cjs',
 	target: 'es2021',
 	logLevel: 'info',

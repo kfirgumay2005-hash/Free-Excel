@@ -1,3 +1,4 @@
+import { getLanguage } from 'obsidian';
 import type { PluginSettings } from './settings';
 
 export type Scalar = string | number | boolean | null;
@@ -113,15 +114,7 @@ export function indexToColumnLabel(index: number): string {
  * imports let you pick the direction.
  */
 export function defaultSheetRtl(): boolean {
-	let lang = 'en';
-	try {
-		lang =
-			window.localStorage.getItem('language') ||
-			navigator.language ||
-			'en';
-	} catch {
-		lang = typeof navigator !== 'undefined' ? navigator.language : 'en';
-	}
+	const lang = getLanguage() || 'en';
 	return /^(he|iw|ar|fa|ur|yi)(-|_|$)/i.test(lang);
 }
 

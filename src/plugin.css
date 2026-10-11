@@ -123,6 +123,22 @@
 	display: inline-block;
 }
 
+.rtl-sheet-rotated.is-vertical {
+	writing-mode: vertical-rl;
+}
+
+.rtl-sheet-rotated.is-flipped {
+	transform: rotate(180deg);
+}
+
+.rtl-sheet-rotated.is-angled {
+	transform: rotate(var(--rtl-sheet-rotate));
+}
+
+.handsontable td.rtl-sheet-img-cell {
+	position: relative;
+}
+
 /* The image fills its cell (or merged cells), so resizing the cell resizes the image. */
 .rtl-sheet-img {
 	position: absolute;
