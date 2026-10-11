@@ -1,5 +1,6 @@
 import FormulaParser from 'fast-formula-parser';
 import { Infix, Postfix } from 'fast-formula-parser/formulas/operators';
+import { indexToColumnLabel } from './model';
 import type { Scalar } from './model';
 
 /* ------------------------------------------------------------------ */
@@ -1264,6 +1265,111 @@ export function shiftFormulaRows(formula: string, delta: number): string {
 								: `${before}${column}${row}`;
 						},
 					),
+		)
+		.join('');
+}
+
+export interface ReferencedRange {
+	r1: number;
+	c1: number;
+	r2: number;
+	c2: number;
+}
+
+const REFERENCED_RE =
+	/(^|[^A-Za-z0-9_.$!])\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?(?![A-Za-z0-9_(.!])/g;
+
+/**
+ * The cells and ranges of this sheet that a formula refers to (0-based), e.g. G30 and
+ * A1:B5 for "=G30+SUM(A1:B5)". References to other sheets and text in quotes are skipped.
+ */
+export function formulaReferences(formula: string): ReferencedRange[] {
+	if (!formula.startsWith('=')) return [];
+	const out: ReferencedRange[] = [];
+	formula.split(/("(?:[^"]|"")*"|'(?:[^']|'')*')/).forEach((part, i) => {
+		if (i % 2 === 1) return;
+		for (const m of part.matchAll(REFERENCED_RE)) {
+			const c1 = colToIndex(m[2] ?? '');
+			const r1 = Number(m[3]) - 1;
+			const c2 = m[4] ? colToIndex(m[4]) : c1;
+			const r2 = m[5] ? Number(m[5]) - 1 : r1;
+			if (r1 < 0 || r2 < 0) continue;
+			out.push({
+				r1: Math.min(r1, r2),
+				c1: Math.min(c1, c2),
+				r2: Math.max(r1, r2),
+				c2: Math.max(c1, c2),
+			});
+		}
+	});
+	return out;
+}
+
+const MOVE_CELL_RE =
+	/(^|[^A-Za-z0-9_.$])(\$?)([A-Za-z]{1,3})(\$?)(\d+)(?![A-Za-z0-9_(.])/g;
+const MOVE_COLUMNS_RE =
+	/(^|[^A-Za-z0-9_.$])(\$?)([A-Za-z]{1,3}):(\$?)([A-Za-z]{1,3})(?![A-Za-z0-9_(.$])/g;
+const MOVE_ROWS_RE =
+	/(^|[^A-Za-z0-9_.$])(\$?)(\d+):(\$?)(\d+)(?![A-Za-z0-9_(.])/g;
+
+/**
+ * Rewrites a formula for a table that was moved as a whole by `rowDelta` rows and
+ * `colDelta` columns (an import that does not start at A1). Every reference moves with
+ * the table, absolute ones ($A$1) too, because the cells they point at moved as well.
+ * Whole columns (A:C) and whole rows (1:5) move the same way; text in quotes is left alone.
+ */
+export function moveFormula(
+	formula: string,
+	rowDelta: number,
+	colDelta: number,
+): string {
+	if ((rowDelta === 0 && colDelta === 0) || !formula.startsWith('=')) {
+		return formula;
+	}
+	const column = (letters: string): string =>
+		indexToColumnLabel(colToIndex(letters) + colDelta);
+	const row = (digits: string): string => String(Number(digits) + rowDelta);
+	return formula
+		.split(/("(?:[^"]|"")*"|'(?:[^']|'')*')/)
+		.map((part, i) =>
+			i % 2 === 1
+				? part
+				: part
+						.replace(
+							MOVE_CELL_RE,
+							(
+								_match: string,
+								before: string,
+								absCol: string,
+								letters: string,
+								absRow: string,
+								digits: string,
+							) =>
+								`${before}${absCol}${column(letters)}${absRow}${row(digits)}`,
+						)
+						.replace(
+							MOVE_COLUMNS_RE,
+							(
+								_match: string,
+								before: string,
+								abs1: string,
+								from: string,
+								abs2: string,
+								to: string,
+							) =>
+								`${before}${abs1}${column(from)}:${abs2}${column(to)}`,
+						)
+						.replace(
+							MOVE_ROWS_RE,
+							(
+								_match: string,
+								before: string,
+								abs1: string,
+								from: string,
+								abs2: string,
+								to: string,
+							) => `${before}${abs1}${row(from)}:${abs2}${row(to)}`,
+						),
 		)
 		.join('');
 }

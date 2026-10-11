@@ -54,6 +54,8 @@ import {
 	FormulaFunctionInfo,
 	buildFunctionCall,
 	evaluateFormula,
+	formulaReferences,
+	moveFormula,
 	normalizeSeparators,
 	referenceSlot,
 	shiftFormulaRows,
@@ -63,8 +65,9 @@ import {
 	ColumnFilterModal,
 	FormulaAutocomplete,
 	FunctionPickerModal,
-	ImportDirectionChoice,
+	ImportChoice,
 	ImportDirectionModal,
+	ImportPrompt,
 	VaultFilePickerModal,
 } from './ui';
 
@@ -83,6 +86,10 @@ const MIN_IMAGE_RESIZE_PX = 24;
 const MAX_IMAGE_RESIZE_PX = 2000;
 /** The corners of an image cell that have a resize handle (physical sides). */
 const IMAGE_CORNERS = ['nw', 'ne', 'sw', 'se'] as const;
+/** Dragging a selection handle this close (px) to an edge of the grid scrolls the sheet. */
+const SEL_SCROLL_EDGE = 36;
+/** Px scrolled per frame while a selection handle is held near an edge. */
+const SEL_SCROLL_STEP = 8;
 /** Extra px added to measured text when a column is widened to fit it. */
 const EXPAND_PADDING = 18;
 const MAX_EXPAND_WIDTH = 600;
@@ -497,6 +504,8 @@ export class SheetView extends TextFileView {
 		range: SelRange | null;
 	} | null = null;
 	private writingRefPick = false;
+	/** The cells that the formula of the selected cell refers to; they get the same dashed outline. */
+	private formulaRefs: SelRange[] = [];
 	/** Formatting copied by the format painter; null when the painter is off. */
 	private painterSource: CellFormat | null = null;
 	/** The side state as it was after the last recorded action (see recordSideChanges). */
@@ -531,8 +540,19 @@ export class SheetView extends TextFileView {
 	private pinch: { startDistance: number; startZoom: number } | null = null;
 	private pendingZoom = 1;
 	private zoomFrame = 0;
+	/** Touch only: the corner handles of the selection (see installSelectionHandles). */
+	private selHandles: { el: HTMLElement; rowEnd: boolean; colEnd: boolean }[] =
+		[];
+	private selHandleFrame = 0;
+	private selDragging = false;
 	/** row -> columns that have a format (rebuilt lazily; used to compute row heights). */
 	private rowIndex: Map<number, number[]> | null = null;
+	/** Computed row heights (unzoomed), kept until the sheet changes: Handsontable asks for them all the time. */
+	private rowHeightCache = new Map<number, number>();
+	/** Formula results by cell, kept until the sheet changes, so a formula is worked out once and not once per cell that uses it. */
+	private formulaCache = new Map<string, { raw: string; value: Scalar }>();
+	/** Counts evaluations that were cut short by the depth limit; such results are not cached. */
+	private formulaLimitHits = 0;
 	private fontFamilyCache: string | null = null;
 	private measureCtx: CanvasRenderingContext2D | null = null;
 
@@ -563,6 +583,7 @@ export class SheetView extends TextFileView {
 			capture: true,
 		});
 		this.applyToolbarScale();
+		this.applySelectionHandleSettings();
 		this.installAutosave();
 		this.installRefreshTimer();
 		// Sync plugins that write through the vault are picked up right away, the timer covers the rest.
@@ -596,6 +617,21 @@ export class SheetView extends TextFileView {
 			'pointerdown',
 			(e) => this.onImageHandlePress(e),
 			{ capture: true },
+		);
+		// Corner handles of the selection (touch screens), handled the same way.
+		this.registerDomEvent(
+			this.gridEl,
+			'pointerdown',
+			(e) => this.onSelectionHandlePress(e),
+			{ capture: true },
+		);
+		// Scrolling brings cells into the rendered part of the grid: a handle whose cell was
+		// not rendered can be placed now. (Scroll events do not bubble, hence the capture.)
+		this.registerDomEvent(
+			this.gridEl,
+			'scroll',
+			() => this.queueSelectionHandles(),
+			{ capture: true, passive: true },
 		);
 		for (const type of ['mousedown', 'touchstart', 'touchend'] as const)
 			this.registerDomEvent(
@@ -863,7 +899,7 @@ export class SheetView extends TextFileView {
 	}
 
 	private markDirty(): void {
-		this.rowIndex = null;
+		this.invalidateRowSizes();
 		this.findStale = true;
 		if (this.loading) return;
 		this.queueSideCheck();
@@ -884,6 +920,7 @@ export class SheetView extends TextFileView {
 
 		if (!prev.autosave && s.autosave && this.dirty) this.requestSave();
 		this.applyToolbarScale();
+		this.applySelectionHandleSettings();
 		this.renderPalette('fill');
 		this.renderPalette('text');
 
@@ -955,7 +992,7 @@ export class SheetView extends TextFileView {
 		this.captureGridState(); // current merges, to compare with the new ones
 		const prev = this.model;
 		this.model = next;
-		this.rowIndex = null;
+		this.invalidateRowSizes();
 
 		hot.updateData(next.data);
 		if (JSON.stringify(prev.merges) !== JSON.stringify(next.merges))
@@ -1103,8 +1140,17 @@ export class SheetView extends TextFileView {
 				raw.length > 1 &&
 				raw.startsWith('=')
 			) {
-				if (depth > 40) return '#CYCLE!';
-				return evaluateFormula(
+				if (depth > 40) {
+					this.formulaLimitHits++;
+					return '#CYCLE!';
+				}
+				const cacheKey = at ? key(at.row, at.col) : null;
+				if (cacheKey) {
+					const hit = this.formulaCache.get(cacheKey);
+					if (hit && hit.raw === raw) return hit.value;
+				}
+				const limitHits = this.formulaLimitHits;
+				const value = evaluateFormula(
 					raw,
 					(r, c) => {
 						const hot: Handsontable.Core | null =
@@ -1120,6 +1166,10 @@ export class SheetView extends TextFileView {
 					},
 					at,
 				);
+				// A result that ran into the depth limit depends on where the evaluation started.
+				if (cacheKey && this.formulaLimitHits === limitHits)
+					this.formulaCache.set(cacheKey, { raw, value });
+				return value;
 			}
 			if (coerce && NUMERIC_RE.test(raw)) return Number(raw);
 			return raw;
@@ -1156,7 +1206,7 @@ export class SheetView extends TextFileView {
 		this.gridEl.toggleClass('is-rtl', m.rtl);
 
 		this.fontFamilyCache = null;
-		this.rowIndex = null;
+		this.invalidateRowSizes();
 		const zoom = this.zoom;
 		const toSizes = (arr: (number | null)[]): (number | undefined)[] =>
 			arr.map((v) => (v ? Math.round(v * zoom) : undefined));
@@ -1222,7 +1272,15 @@ export class SheetView extends TextFileView {
 					readOnly: !!this.model.images[key(row, col)],
 				}),
 				beforeKeyDown: (event) => this.onBeforeKeyDown(event),
+				// A full render follows every change to the sheet, so it starts from fresh row
+				// heights and formula results; moving the selection and scrolling reuse them.
+				beforeRender: (isForced) => {
+					if (!isForced) return;
+					this.rowHeightCache.clear();
+					this.formulaCache.clear();
+				},
 				afterChange: (changes, source) => {
+					this.invalidateRowSizes();
 					if (source === 'loadData' || this.loading) return;
 					const expandCols: number[] = [];
 					for (const change of changes ?? []) {
@@ -1239,12 +1297,16 @@ export class SheetView extends TextFileView {
 					}
 					if (expandCols.length > 0)
 						this.fitExpandColumns(expandCols);
+					this.readFormulaRefs(); // the selected cell's formula may be the one that changed
 					if (this.plugin.settings.enableFormulas && this.hot)
 						this.hot.render();
 					this.markDirty();
 					this.refreshToolbarState();
 				},
-				afterSelectionEnd: () => this.onSelectionChanged(),
+				// A drag of a selection handle reports once, when it ends.
+				afterSelectionEnd: () => {
+					if (!this.selDragging) this.onSelectionChanged();
+				},
 				afterBeginEditing: () => this.onBeginEditing(),
 				afterCreateRow: (index, amount) => {
 					if (this.loading) return;
@@ -1326,6 +1388,7 @@ export class SheetView extends TextFileView {
 			this.hot = new Handsontable(this.gridEl, options);
 			// The first render ran before `this.hot` existed; render again so formulas see all cells.
 			if (this.plugin.settings.enableFormulas) this.hot.render();
+			this.installSelectionHandles(this.hot);
 			this.formulaCell = null;
 			const undo = this.undoPlugin();
 			if (history && undo) {
@@ -1384,6 +1447,8 @@ export class SheetView extends TextFileView {
 	/** Row heights are computed from the fonts; call after anything that can change them. */
 	private invalidateRowSizes(): void {
 		this.rowIndex = null;
+		this.rowHeightCache.clear();
+		this.formulaCache.clear();
 	}
 
 	private getRowIndex(): Map<number, number[]> {
@@ -1407,16 +1472,34 @@ export class SheetView extends TextFileView {
 	 * Sheets), for the wrapped lines of "wrap" cells and for vertical text.
 	 */
 	private computeRowHeight(row: number): number {
+		const cached = this.rowHeightCache.get(row);
+		if (cached !== undefined) return cached;
+		const hot: Handsontable.Core | null = this.gridForCalc ?? this.hot;
+		const height = this.measureRowHeight(row, hot);
+		// Without a grid the wrapped text was not measured: do not keep that height.
+		if (hot && !hot.isDestroyed) this.rowHeightCache.set(row, height);
+		return height;
+	}
+
+	private measureRowHeight(
+		row: number,
+		hot: Handsontable.Core | null,
+	): number {
 		const defaultSize = this.plugin.settings.defaultFontSize;
 		let height = rowBaseHeight(defaultSize);
 		const cols = this.getRowIndex().get(row);
 		if (!cols) return height;
 
-		const hot: Handsontable.Core | null = this.gridForCalc ?? this.hot;
+		const rowMerges = this.liveMerges(hot).filter(
+			(m) => row >= m.row && row < m.row + m.rowspan,
+		);
 		for (const col of cols) {
 			const f = this.model.cellFormats[key(row, col)];
 			if (!f) continue;
-			const mg = this.mergeAt(hot, row, col);
+			const mg =
+				rowMerges.find(
+					(m) => col >= m.col && col < m.col + m.colspan,
+				) ?? null;
 			// Cells hidden inside a merge keep their format but show nothing.
 			if (mg && (mg.row !== row || mg.col !== col)) continue;
 			const size = f.fontSize ?? defaultSize;
@@ -1730,15 +1813,7 @@ export class SheetView extends TextFileView {
 			'rtl-sheet-img-cell',
 			'rtl-sheet-img-active',
 		);
-		const picked = this.refPick?.range;
-		td.classList.toggle(
-			'rtl-sheet-ref-pick',
-			!!picked &&
-				row >= picked.r1 &&
-				row <= picked.r2 &&
-				col >= picked.c1 &&
-				col <= picked.c2,
-		);
+		td.classList.toggle('rtl-sheet-ref-pick', this.isOutlined(row, col));
 		const found = this.findMatches[this.findIndex];
 		td.classList.toggle(
 			'rtl-sheet-find-hit',
@@ -2010,11 +2085,205 @@ export class SheetView extends TextFileView {
 		doc.addEventListener('pointercancel', onEnd);
 	}
 
-	/** Mouse and touch events that follow a press on an image handle must not reach the grid. */
+	/* ---------------- Selection handles (touch) ---------------- */
+
+	/**
+	 * Touch screens cannot drag over cells to select them (a drag scrolls), so the selection
+	 * gets a handle on each corner: dragging one stretches the selection from the opposite
+	 * corner. The handles live inside the scrolled part of the grid, so they move with the
+	 * cells and pass under the headers.
+	 */
+	private installSelectionHandles(hot: Handsontable): void {
+		this.selHandles = [];
+		if (!IS_TOUCH) return;
+		const hider = this.gridEl.querySelector('.ht_master .wtHider');
+		if (!hider) return;
+		for (const rowEnd of [false, true])
+			for (const colEnd of [false, true])
+				this.selHandles.push({
+					el: hider.createDiv({ cls: 'rtl-sheet-sel-handle' }),
+					rowEnd,
+					colEnd,
+				});
+		const queue = (): void => this.queueSelectionHandles();
+		hot.addHook('afterSelection', queue);
+		hot.addHook('afterDeselect', queue);
+		hot.addHook('afterViewRender', queue);
+		this.placeSelectionHandles();
+	}
+
+	/** The size of the handles and how many of them show are settings. */
+	private applySelectionHandleSettings(): void {
+		this.gridEl.setCssProps({
+			'--rtl-sheet-sel-scale': String(
+				this.plugin.settings.selectionHandleScale / 100,
+			),
+		});
+		this.queueSelectionHandles();
+	}
+
+	private queueSelectionHandles(): void {
+		if (this.selHandles.length === 0 || this.selHandleFrame) return;
+		this.selHandleFrame = window.requestAnimationFrame(() => {
+			this.selHandleFrame = 0;
+			this.placeSelectionHandles();
+		});
+	}
+
+	/** Puts each handle on its corner of the selection; a corner that is not rendered has none. */
+	private placeSelectionHandles(): void {
+		const hot = this.hot;
+		const hider = this.selHandles[0]?.el.parentElement;
+		const ranges = this.getSelectedRanges();
+		const rg = ranges[ranges.length - 1];
+		const hideAll = (): void => {
+			for (const h of this.selHandles) h.el.hide();
+		};
+		if (!hot || hot.isDestroyed || !hider || !hider.isConnected || !rg)
+			return hideAll();
+
+		const hidden = hot.getPlugin('hiddenRows');
+		const c1 = rg.c1;
+		const c2 = Math.min(rg.c2, hot.countCols() - 1);
+		let r1 = rg.r1;
+		let r2 = Math.min(rg.r2, hot.countRows() - 1);
+		// Rows hidden by a filter have no cells: use the nearest visible row.
+		while (r1 < r2 && hidden.isHidden(r1)) r1++;
+		while (r2 > r1 && hidden.isHidden(r2)) r2--;
+		// A selected image cell shows its own resize handles on the same corners.
+		if (
+			this.model.images[key(rg.r1, rg.c1)] &&
+			hot.getCell(r1, c1) === hot.getCell(r2, c2)
+		)
+			return hideAll();
+
+		const base = hider.getBoundingClientRect();
+		const rtl = this.model.rtl;
+		const onlyTwo = this.plugin.settings.selectionHandles === 'two';
+		for (const h of this.selHandles) {
+			// In a right-to-left sheet the first column is on the right.
+			const onRight = h.colEnd !== rtl;
+			// With two handles: the top right and the bottom left corners.
+			if (onlyTwo && onRight === h.rowEnd) {
+				h.el.hide();
+				continue;
+			}
+			const td = hot.getCell(h.rowEnd ? r2 : r1, h.colEnd ? c2 : c1);
+			const rect = td?.getBoundingClientRect();
+			if (
+				!td ||
+				!rect ||
+				!hider.contains(td) ||
+				(rect.width === 0 && rect.height === 0)
+			) {
+				h.el.hide();
+				continue;
+			}
+			const x = onRight ? rect.right : rect.left;
+			const y = h.rowEnd ? rect.bottom : rect.top;
+			h.el.style.left = `${x - base.left}px`;
+			h.el.style.top = `${y - base.top}px`;
+			h.el.show();
+		}
+	}
+
+	/** A press on a selection handle starts stretching the selection from the opposite corner. */
+	private onSelectionHandlePress(e: PointerEvent): void {
+		const hot = this.hot;
+		const handle = this.selHandles.find((h) => h.el === e.target);
+		const ranges = this.getSelectedRanges();
+		const rg = ranges[ranges.length - 1];
+		if (!handle || !rg || !hot || hot.isDestroyed) return;
+		if (e.pointerType === 'mouse' && e.button !== 0) return;
+		// Keep the press away from Handsontable and from the scrolling of the grid.
+		e.preventDefault();
+		e.stopImmediatePropagation();
+
+		const anchorRow = Math.min(
+			handle.rowEnd ? rg.r1 : rg.r2,
+			hot.countRows() - 1,
+		);
+		const anchorCol = Math.min(
+			handle.colEnd ? rg.c1 : rg.c2,
+			hot.countCols() - 1,
+		);
+		const holder = this.gridEl.querySelector('.ht_master .wtHolder');
+		const doc = this.gridEl.ownerDocument;
+		let x = e.clientX;
+		let y = e.clientY;
+		let lastRow = -1;
+		let lastCol = -1;
+		let frame = 0;
+		this.selDragging = true;
+		// The handles let the press through, so the cell under the finger can be found.
+		this.gridEl.addClass('is-sel-dragging');
+
+		const step = (): void => {
+			frame = 0;
+			if (hot.isDestroyed) return;
+			// Near an edge of the grid the sheet scrolls, so the selection can grow past the screen.
+			if (holder) {
+				const box = holder.getBoundingClientRect();
+				const dx =
+					x < box.left + SEL_SCROLL_EDGE
+						? -SEL_SCROLL_STEP
+						: x > box.right - SEL_SCROLL_EDGE
+							? SEL_SCROLL_STEP
+							: 0;
+				const dy =
+					y < box.top + SEL_SCROLL_EDGE
+						? -SEL_SCROLL_STEP
+						: y > box.bottom - SEL_SCROLL_EDGE
+							? SEL_SCROLL_STEP
+							: 0;
+				if (dx !== 0 || dy !== 0) {
+					holder.scrollBy(dx, dy);
+					frame = window.requestAnimationFrame(step);
+				}
+			}
+			const cell = doc
+				.elementFromPoint(x, y)
+				?.closest<HTMLTableCellElement>('td, th');
+			if (!cell || !this.gridEl.contains(cell)) return;
+			const coords = hot.getCoords(cell);
+			if (!coords) return;
+			// Over a header the selection reaches the first row or column.
+			const row = Math.max(0, coords.row ?? 0);
+			const col = Math.max(0, coords.col ?? 0);
+			if (row === lastRow && col === lastCol) return;
+			lastRow = row;
+			lastCol = col;
+			hot.selectCell(anchorRow, anchorCol, row, col, false);
+		};
+		const onMove = (ev: PointerEvent): void => {
+			if (ev.pointerId !== e.pointerId) return;
+			ev.preventDefault();
+			x = ev.clientX;
+			y = ev.clientY;
+			if (!frame) frame = window.requestAnimationFrame(step);
+		};
+		const onEnd = (ev: PointerEvent): void => {
+			if (ev.pointerId !== e.pointerId) return;
+			doc.removeEventListener('pointermove', onMove);
+			doc.removeEventListener('pointerup', onEnd);
+			doc.removeEventListener('pointercancel', onEnd);
+			if (frame) window.cancelAnimationFrame(frame);
+			this.selDragging = false;
+			this.gridEl.removeClass('is-sel-dragging');
+			if (lastRow < 0 || hot.isDestroyed) return;
+			this.onSelectionChanged();
+			this.queueSelectionHandles();
+		};
+		doc.addEventListener('pointermove', onMove, { passive: false });
+		doc.addEventListener('pointerup', onEnd);
+		doc.addEventListener('pointercancel', onEnd);
+	}
+
+	/** Mouse and touch events that follow a press on a handle must not reach the grid. */
 	private keepHandlePress(e: Event): void {
 		if (
 			e.target instanceof HTMLElement &&
-			e.target.closest('.rtl-sheet-img-handle')
+			e.target.closest('.rtl-sheet-img-handle, .rtl-sheet-sel-handle')
 		) {
 			if (e.cancelable && e.type === 'mousedown') e.preventDefault();
 			e.stopImmediatePropagation();
@@ -2802,10 +3071,58 @@ export class SheetView extends TextFileView {
 		}
 	}
 
+	/** True for a cell picked into the formula being typed, or used by the selected cell's formula. */
+	private isOutlined(row: number, col: number): boolean {
+		const inside = (rg: SelRange): boolean =>
+			row >= rg.r1 && row <= rg.r2 && col >= rg.c1 && col <= rg.c2;
+		const picked = this.refPick?.range;
+		return (!!picked && inside(picked)) || this.formulaRefs.some(inside);
+	}
+
+	/** Reads the references of the selected cell's formula; true when they changed. */
+	private readFormulaRefs(): boolean {
+		const hot = this.hot;
+		const cell = this.formulaCell;
+		const raw: unknown =
+			cell &&
+			hot &&
+			!hot.isDestroyed &&
+			this.plugin.settings.enableFormulas
+				? hot.getSourceDataAtCell(cell.row, cell.col)
+				: null;
+		const next = typeof raw === 'string' ? formulaReferences(raw) : [];
+		const changed = JSON.stringify(next) !== JSON.stringify(this.formulaRefs);
+		this.formulaRefs = next;
+		return changed;
+	}
+
+	/**
+	 * Outlines the cells that the selected cell's formula uses (the G30 of "=G30"). Only the
+	 * cells on screen are touched, so moving the selection does not draw the grid again; the
+	 * renderer outlines the rest as they scroll into view.
+	 */
+	private refreshFormulaRefs(): void {
+		if (!this.readFormulaRefs()) return;
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		this.gridEl
+			.querySelectorAll<HTMLTableCellElement>('.ht_master td')
+			.forEach((td) => {
+				const coords = hot.getCoords(td);
+				const row = coords?.row ?? -1;
+				const col = coords?.col ?? -1;
+				td.classList.toggle(
+					'rtl-sheet-ref-pick',
+					row >= 0 && col >= 0 && this.isOutlined(row, col),
+				);
+			});
+	}
+
 	private onSelectionChanged(): void {
 		this.clearRefPick();
 		const first = this.getSelectedRanges()[0];
 		this.formulaCell = first ? { row: first.r1, col: first.c1 } : null;
+		this.refreshFormulaRefs();
 		this.markActiveImageCell();
 
 		if (this.painterSource) {
@@ -4259,11 +4576,9 @@ export class SheetView extends TextFileView {
 		).open();
 	}
 
-	private askImportDirection(
-		detectedRtl: boolean,
-	): Promise<ImportDirectionChoice | null> {
+	private askImportChoice(prompt: ImportPrompt): Promise<ImportChoice | null> {
 		return new Promise((resolve) => {
-			new ImportDirectionModal(this.app, detectedRtl, resolve).open();
+			new ImportDirectionModal(this.app, prompt, resolve).open();
 		});
 	}
 
@@ -4275,17 +4590,55 @@ export class SheetView extends TextFileView {
 					? parseCsv(decodeText(data))
 					: await parseXlsx(data);
 
-			const choice = await this.askImportDirection(imported.rtl);
+			// The start cell is read now: the dialog and a direction change both drop the selection.
+			const anchor = this.getSelectedRanges()[0];
+			const ar = anchor?.r1 ?? 0;
+			const ac = anchor?.c1 ?? 0;
+
+			const choice = await this.askImportChoice({
+				detectedRtl: imported.rtl,
+				startCell: `${indexToColumnLabel(ac)}${ar + 1}`,
+				hasFormulas: Object.keys(imported.results).length > 0,
+			});
 			if (choice === null) return; // dialog dismissed: cancel the import
-			if (choice !== 'keep') this.setDirection(choice === 'rtl');
-			this.applyImported(imported);
+			if (choice.direction !== 'keep')
+				this.setDirection(choice.direction === 'rtl');
+			this.applyImported(imported, ar, ac, choice.keepFormulas);
 		} catch (e) {
 			this.plugin.reportError('Import failed', e);
 		}
 	}
 
-	/** Writes imported data into this sheet, starting at the selected cell (or A1). */
-	private applyImported(imp: ImportedSheet): void {
+	/**
+	 * The cells of an imported table as they should be written at row `ar`, column `ac`:
+	 * formulas are moved so they keep pointing at the same imported cells, or replaced by
+	 * the values the file stored for them.
+	 */
+	private importedCells(
+		imp: ImportedSheet,
+		ar: number,
+		ac: number,
+		keepFormulas: boolean,
+	): Scalar[][] {
+		return imp.data.map((row, r) =>
+			row.map((v, c) => {
+				if (typeof v !== 'string' || v.length < 2 || !v.startsWith('='))
+					return v;
+				const k = key(r, c);
+				if (!keepFormulas && k in imp.results)
+					return imp.results[k] ?? null;
+				return moveFormula(v, ar, ac);
+			}),
+		);
+	}
+
+	/** Writes imported data into this sheet, starting at row `ar`, column `ac`. */
+	private applyImported(
+		imp: ImportedSheet,
+		ar: number,
+		ac: number,
+		keepFormulas: boolean,
+	): void {
 		const hot = this.hot;
 		if (!hot || hot.isDestroyed) return;
 		const rows = imp.data.length;
@@ -4295,40 +4648,43 @@ export class SheetView extends TextFileView {
 			return;
 		}
 
-		const anchor = this.getSelectedRanges()[0];
-		const ar = anchor?.r1 ?? 0;
-		const ac = anchor?.c1 ?? 0;
+		// One render for the whole import: each merge would otherwise draw the grid again.
+		hot.batch(() => {
+			const missingRows = ar + rows - hot.countRows();
+			if (missingRows > 0)
+				hot.alter('insert_row_below', hot.countRows() - 1, missingRows);
+			const missingCols = ac + cols - hot.countCols();
+			if (missingCols > 0)
+				hot.alter('insert_col_end', hot.countCols() - 1, missingCols);
 
-		const missingRows = ar + rows - hot.countRows();
-		if (missingRows > 0)
-			hot.alter('insert_row_below', hot.countRows() - 1, missingRows);
-		const missingCols = ac + cols - hot.countCols();
-		if (missingCols > 0)
-			hot.alter('insert_col_end', hot.countCols() - 1, missingCols);
-
-		hot.populateFromArray(ar, ac, imp.data);
-
-		for (const [k, f] of Object.entries(imp.formats)) {
-			const parts = k.split(',').map(Number);
-			const r = parts[0] ?? 0;
-			const c = parts[1] ?? 0;
-			this.model.cellFormats[key(r + ar, c + ac)] = f;
-		}
-
-		const mergePlugin = hot.getPlugin('mergeCells');
-		for (const mg of imp.merges) {
-			mergePlugin.merge(
-				mg.row + ar,
-				mg.col + ac,
-				mg.row + mg.rowspan - 1 + ar,
-				mg.col + mg.colspan - 1 + ac,
+			hot.populateFromArray(
+				ar,
+				ac,
+				this.importedCells(imp, ar, ac, keepFormulas),
 			);
-		}
-		imp.colWidths.forEach((w, i) => {
-			if (w) this.setColumnWidth(i + ac, w);
-		});
-		imp.rowHeights.forEach((h, i) => {
-			if (h) this.setRowHeight(i + ar, h);
+
+			for (const [k, f] of Object.entries(imp.formats)) {
+				const parts = k.split(',').map(Number);
+				const r = parts[0] ?? 0;
+				const c = parts[1] ?? 0;
+				this.model.cellFormats[key(r + ar, c + ac)] = f;
+			}
+
+			const mergePlugin = hot.getPlugin('mergeCells');
+			for (const mg of imp.merges) {
+				mergePlugin.merge(
+					mg.row + ar,
+					mg.col + ac,
+					mg.row + mg.rowspan - 1 + ar,
+					mg.col + mg.colspan - 1 + ac,
+				);
+			}
+			imp.colWidths.forEach((w, i) => {
+				if (w) this.setColumnWidth(i + ac, w);
+			});
+			imp.rowHeights.forEach((h, i) => {
+				if (h) this.setRowHeight(i + ar, h);
+			});
 		});
 
 		this.invalidateRowSizes();

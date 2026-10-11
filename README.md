@@ -13,7 +13,9 @@ A real spreadsheet inside your Obsidian vault. Free, offline, on desktop and mob
 
 ## A few words
 
-When I heard the following lines I felt like I had to give the people MORE!
+can't belive this op plugin got shadowbanned because of one warning pretty shameful.
+
+When I heard the following lines I felt like I had to give the people MORE! :
 
 “It's about drive, it's about power.
 We stay hungry, we devour.

@@ -318,6 +318,31 @@
 	pointer-events: auto;
 }
 
+/* Selection handles (touch screens): one on each corner of the selection, drag to select more
+   cells. The element is the touch target; the dot inside it is what shows. */
+.rtl-sheet-sel-handle {
+	position: absolute;
+	z-index: 10;
+	/* The size is a setting: the touch area and the dot scale together. */
+	width: calc(26px * var(--rtl-sheet-sel-scale, 1));
+	height: calc(26px * var(--rtl-sheet-sel-scale, 1));
+	transform: translate(-50%, -50%);
+	touch-action: none;
+}
+
+.rtl-sheet-sel-handle::after {
+	content: '';
+	position: absolute;
+	inset: calc(6px * var(--rtl-sheet-sel-scale, 1));
+	border: 2px solid var(--background-primary);
+	border-radius: 50%;
+	background: var(--interactive-accent);
+}
+
+.rtl-sheet-grid.is-sel-dragging .rtl-sheet-sel-handle {
+	pointer-events: none;
+}
+
 /* ---------- Function autocomplete popup (attached to <body>) ---------- */
 
 .rtl-sheet-autocomplete {

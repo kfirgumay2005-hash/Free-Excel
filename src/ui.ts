@@ -328,28 +328,68 @@ export class VaultFilePickerModal extends FuzzySuggestModal<TFile> {
 
 export type ImportDirectionChoice = 'rtl' | 'ltr' | 'keep';
 
-/** Asks how the imported table should be laid out: right-to-left, left-to-right, or as the sheet already is. */
+export interface ImportChoice {
+	direction: ImportDirectionChoice;
+	/** False to import the values the file stored for its formulas instead of the formulas. */
+	keepFormulas: boolean;
+}
+
+export interface ImportPrompt {
+	detectedRtl: boolean;
+	/** Label of the cell the table starts at, e.g. "B3". */
+	startCell: string;
+	/** True when the file has formulas together with their values, so there is a choice to make. */
+	hasFormulas: boolean;
+}
+
+/**
+ * Asks how the imported table should be laid out (right-to-left, left-to-right, or as the
+ * sheet already is) and whether its formulas are kept or replaced by their values.
+ */
 export class ImportDirectionModal extends Modal {
-	private readonly detectedRtl: boolean;
-	private readonly onChoose: (choice: ImportDirectionChoice | null) => void;
+	private readonly prompt: ImportPrompt;
+	private readonly onChoose: (choice: ImportChoice | null) => void;
+	private keepFormulas = true;
 	private chosen = false;
 
 	constructor(
 		app: App,
-		detectedRtl: boolean,
-		onChoose: (choice: ImportDirectionChoice | null) => void,
+		prompt: ImportPrompt,
+		onChoose: (choice: ImportChoice | null) => void,
 	) {
 		super(app);
-		this.detectedRtl = detectedRtl;
+		this.prompt = prompt;
 		this.onChoose = onChoose;
 	}
 
 	onOpen(): void {
 		const { contentEl } = this;
+		const { detectedRtl, startCell, hasFormulas } = this.prompt;
 		contentEl.empty();
-		contentEl.createEl('h3', { text: 'Import direction' });
+		contentEl.createEl('h3', { text: 'Import table' });
 		contentEl.createEl('p', {
-			text: `The imported table looks ${this.detectedRtl ? 'right-to-left' : 'left-to-right'}. How should the sheet be laid out?`,
+			text: `The table is placed starting at the selected cell (${startCell}).`,
+		});
+
+		if (hasFormulas) {
+			new Setting(contentEl)
+				.setName('Formulas')
+				.setDesc(
+					`Formulas are adjusted so that A1 of the imported table becomes ${startCell}.`,
+				)
+				.addDropdown((dropdown) => {
+					dropdown
+						.addOption('formulas', 'Keep formulas')
+						.addOption('values', 'Values only')
+						.setValue('formulas')
+						.onChange((value) => {
+							this.keepFormulas = value === 'formulas';
+						});
+				});
+		}
+
+		contentEl.createEl('p', {
+			text: `The imported table looks ${detectedRtl ? 'right-to-left' : 'left-to-right'}. How should the sheet be laid out?`,
 		});
 
 		const buttons = contentEl.createDiv({
@@ -367,11 +407,14 @@ export class ImportDirectionModal extends Modal {
 			btn.addEventListener('click', () => {
 				this.chosen = true;
 				this.close();
-				this.onChoose(choice);
+				this.onChoose({
+					direction: choice,
+					keepFormulas: this.keepFormulas,
+				});
 			});
 		};
-		add('Right to left', 'rtl', this.detectedRtl);
-		add('Left to right', 'ltr', !this.detectedRtl);
+		add('Right to left', 'rtl', detectedRtl);
+		add('Left to right', 'ltr', !detectedRtl);
 		add("Keep this sheet's direction", 'keep', false);
 	}
 

@@ -1,4 +1,9 @@
-import { App, PluginSettingTab, SettingDefinitionItem } from 'obsidian';
+import {
+	App,
+	PluginSettingTab,
+	SettingDefinitionItem,
+	SliderComponent,
+} from 'obsidian';
 import type RtlSpreadsheetPlugin from './main';
 
 export interface PluginSettings {
@@ -14,6 +19,10 @@ export interface PluginSettings {
 	/** Toolbar size in percent, on desktop and on mobile (phones and tablets). */
 	toolbarScaleDesktop: number;
 	toolbarScaleMobile: number;
+	/** Touch screens: size in percent of the selection handles (the dot and its touch area). */
+	selectionHandleScale: number;
+	/** Touch screens: a handle on all four corners of the selection, or on two opposite ones. */
+	selectionHandles: 'four' | 'two';
 	/** Colors saved in the toolbar for one-click use, as "#rrggbb" (managed from the toolbar). */
 	savedFillColors: string[];
 	savedTextColors: string[];
@@ -33,6 +42,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	enableFormulas: true,
 	toolbarScaleDesktop: 100,
 	toolbarScaleMobile: 100,
+	selectionHandleScale: 100,
+	selectionHandles: 'four',
 	savedFillColors: [],
 	savedTextColors: [],
 };
@@ -108,6 +119,13 @@ export function sanitizeSettings(
 			50,
 			150,
 		),
+		selectionHandleScale: toInt(
+			s.selectionHandleScale,
+			DEFAULT_SETTINGS.selectionHandleScale,
+			50,
+			250,
+		),
+		selectionHandles: s.selectionHandles === 'two' ? 'two' : 'four',
 		savedFillColors: toColors(s.savedFillColors),
 		savedTextColors: toColors(s.savedTextColors),
 	};
@@ -256,6 +274,61 @@ export class SettingsTab extends PluginSettingTab {
 							min: 50,
 							max: 150,
 							step: 5,
+						},
+					},
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Touch selection',
+				items: [
+					{
+						name: 'Selection handle size (%)',
+						desc: 'Size of the dots on the corners of the selection on touch screens, together with their touch area. Applies to all open sheets immediately.',
+						render: (setting) => {
+							let slider: SliderComponent | null = null;
+							setting
+								.addSlider((sl) => {
+									slider = sl;
+									sl.setLimits(50, 250, 10)
+										.setValue(
+											this.plugin.settings
+												.selectionHandleScale,
+										)
+										.setDynamicTooltip()
+										.onChange((value) =>
+											this.setControlValue(
+												'selectionHandleScale',
+												value,
+											),
+										);
+								})
+								.addExtraButton((btn) =>
+									btn
+										.setIcon('rotate-ccw')
+										.setTooltip('Reset to default size')
+										.onClick(() => {
+											const value =
+												DEFAULT_SETTINGS.selectionHandleScale;
+											slider?.setValue(value);
+											void this.setControlValue(
+												'selectionHandleScale',
+												value,
+											);
+										}),
+								);
+						},
+					},
+					{
+						name: 'Selection handles',
+						desc: 'Show a handle on every corner of the selection, or only on the top right and bottom left corners.',
+						control: {
+							type: 'dropdown',
+							key: 'selectionHandles',
+							options: {
+								four: 'All four corners',
+								two: 'Top right and bottom left',
+							},
 						},
 					},
 				],

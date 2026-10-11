@@ -3,7 +3,10 @@ import { CellFormat, MergeInfo, Scalar, key } from './model';
 
 /** Data read from an external file, positioned relative to its own top-left cell. */
 export interface ImportedSheet {
+	/** Cell contents; formula cells hold the formula text ("=A1+B1") as written in the file. */
 	data: Scalar[][];
+	/** The values the file stored for its formula cells, keyed "row,col" (empty when it stores none, like CSV). */
+	results: Record<string, Scalar>;
 	formats: Record<string, CellFormat>;
 	merges: MergeInfo[];
 	colWidths: (number | null)[];
@@ -256,6 +259,7 @@ export function parseCsv(text: string): ImportedSheet {
 
 	return {
 		data,
+		results: {},
 		formats: {},
 		merges: [],
 		colWidths: [],
@@ -299,10 +303,16 @@ function argbToHex(argb: string | undefined): string | undefined {
 	return undefined;
 }
 
-function cellValueToScalar(cell: ExcelJS.Cell): Scalar {
+/** The formula of a cell as "=…" (shared formulas come already adjusted to the cell), or null. */
+function cellFormula(cell: ExcelJS.Cell): string | null {
 	const formula = (cell as unknown as { formula?: unknown }).formula;
-	if (typeof formula === 'string' && formula.length > 0) return `=${formula}`;
+	return typeof formula === 'string' && formula.length > 0
+		? `=${formula}`
+		: null;
+}
 
+/** The value of a cell; for a formula cell, the result the file stored for it. */
+function cellValueToScalar(cell: ExcelJS.Cell): Scalar {
 	const v: unknown = cell.value;
 	if (v === null || v === undefined) return null;
 	if (v instanceof Date) return formatDateWithNumFmt(v, cell.numFmt);
@@ -323,6 +333,12 @@ function cellValueToScalar(cell: ExcelJS.Cell): Scalar {
 		const o = v as Record<string, unknown>;
 		if ('result' in o) {
 			const r = o.result;
+			if (typeof r === 'number' && isDateFormat(cell.numFmt)) {
+				return formatDateWithNumFmt(
+					new Date(Math.round((r - 25569) * 86400 * 1000)),
+					cell.numFmt,
+				);
+			}
 			if (
 				typeof r === 'string' ||
 				typeof r === 'number' ||
@@ -330,6 +346,10 @@ function cellValueToScalar(cell: ExcelJS.Cell): Scalar {
 			)
 				return r;
 			if (r instanceof Date) return formatDateWithNumFmt(r, cell.numFmt);
+			if (typeof r === 'object' && r !== null) {
+				const error = (r as { error?: unknown }).error;
+				if (typeof error === 'string') return error;
+			}
 			return null;
 		}
 		if (Array.isArray(o.richText)) {
@@ -434,6 +454,7 @@ export async function parseXlsx(buffer: ArrayBuffer): Promise<ImportedSheet> {
 		Array<Scalar>(cols).fill(null),
 	);
 	const formats: Record<string, CellFormat> = {};
+	const results: Record<string, Scalar> = {};
 
 	ws.eachRow({ includeEmpty: true }, (row, rowNumber) => {
 		const r = rowNumber - 1;
@@ -445,7 +466,9 @@ export async function parseXlsx(buffer: ArrayBuffer): Promise<ImportedSheet> {
 			const isSlaveOfMerge = cell.isMerged && cell.master !== cell;
 			if (!isSlaveOfMerge) {
 				const rowData = data[r];
-				if (rowData) rowData[c] = cellValueToScalar(cell);
+				const formula = cellFormula(cell);
+				if (rowData) rowData[c] = formula ?? cellValueToScalar(cell);
+				if (formula) results[key(r, c)] = cellValueToScalar(cell);
 			}
 			const f = extractFormat(cell);
 			if (f) formats[key(r, c)] = f;
@@ -492,5 +515,5 @@ export async function parseXlsx(buffer: ArrayBuffer): Promise<ImportedSheet> {
 		.views?.[0];
 	const rtl = view?.rightToLeft === true || detectRtl(data);
 
-	return { data, formats, merges, colWidths, rowHeights, rtl };
+	return { data, results, formats, merges, colWidths, rowHeights, rtl };
 }
