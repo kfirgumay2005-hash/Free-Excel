@@ -1,6 +1,6 @@
 {
 	"name": "free-excel",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"description": "Actually Excel in obsidian frfr thank me later or prob never but i still love yall xoxo.",
 	"main": "main.js",
 	"type": "module",

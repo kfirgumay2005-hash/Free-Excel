@@ -21,11 +21,42 @@ const cssToStyles = {
 	setup(build) {
 		build.onEnd(() => {
 			if (!fs.existsSync('main.css')) return;
-			fs.copyFileSync('main.css', 'styles.css');
+			fs.writeFileSync('styles.css', cleanVendorCss(fs.readFileSync('main.css', 'utf8')));
 			fs.unlinkSync('main.css');
 		});
 	},
 };
+
+/**
+ * Handsontable's CSS trips Obsidian's CSS lint in a few places that can be
+ * dropped without changing how the grid looks in Obsidian (Chromium):
+ * - legacy cursor fallbacks (move, -moz-grab, -webkit-grab) before the standard value
+ * - clip-path on the license badge, which is already a 1px box with hidden overflow
+ * - text-indent on the nesting buttons, whose text is already hidden by font-size: 0
+ * - column-gap on sortable headers with a header button (column sorting is not used)
+ * - every rule with `:has` in its selector: they style the dialog, the multi-select editor,
+ *   sortable headers and checked context-menu items, none of which this plugin shows
+ * The `!important` rules stay: they override inline styles that Handsontable sets from
+ * JavaScript (selection borders, handles), which no selector specificity can do.
+ */
+const vendorCssFixes = [
+	[/(?:cursor:\s*(?:move|-moz-grab(?:bing)?|-webkit-grab(?:bing)?);\s*)+(cursor:\s*grab(?:bing)?)/g, '$1'],
+	[/(\.ht-license-badge\s*\{\s*)clip-path:\s*inset\(50%\);\s*/g, '$1'],
+	[/text-indent:\s*-100px;\s*/g, ''],
+	[/\.handsontable \.relative\.has-sort-indicator\.has-header-button\s*\{\s*column-gap:[^{}]*\}\s*/g, ''],
+	[/(?<=^|[{}])[^{}]*:has\([^{}]*\{[^{}]*\}/g, ''],
+];
+
+function cleanVendorCss(css) {
+	for (const [pattern, replacement] of vendorCssFixes) {
+		const cleaned = css.replace(pattern, replacement);
+		// A Handsontable update may reword these rules; fail loudly instead of silently skipping.
+		if (prod && cleaned === css)
+			throw new Error(`css-to-styles: ${pattern} no longer matches; update vendorCssFixes.`);
+		css = cleaned;
+	}
+	return css;
+}
 
 /**
  * ExcelJS's browser bundle ships setImmediate polyfills (from JSZip and core-js)
