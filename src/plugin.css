@@ -52,6 +52,8 @@
 	flex: 0 0 auto;
 	border-bottom: 1px solid var(--background-modifier-border);
 	background: var(--background-primary);
+	/* Set from the toolbar size settings (desktop and mobile separately). */
+	zoom: var(--rtl-sheet-toolbar-zoom, 1);
 }
 
 .rtl-spreadsheet-view .rtl-sheet-toolbar-group {

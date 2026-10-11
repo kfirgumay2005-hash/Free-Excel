@@ -60,17 +60,7 @@ interface Arg {
 }
 type LibFunction = (...args: (Arg | undefined)[]) => unknown;
 
-interface LibError {
-	error: string;
-}
-const LibFormulaError = FormulaParser.FormulaError as unknown as {
-	new (error: string): LibError;
-	DIV0: LibError;
-	NA: LibError;
-	REF: LibError;
-	NUM: LibError;
-	VALUE: LibError;
-};
+const LibFormulaError = FormulaParser.FormulaError;
 
 /** Cells hold errors as text such as "#DIV/0!"; the library needs its own error objects to pass them on. */
 function toLibValue(v: Scalar): unknown {
@@ -109,9 +99,10 @@ function argScalar(arg: Arg | undefined): unknown {
 
 function argText(arg: Arg | undefined): string {
 	const v = argScalar(arg);
-	if (v === null || v === undefined) return '';
+	if (typeof v === 'string') return v;
+	if (typeof v === 'number') return String(v);
 	if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
-	return String(v as string | number);
+	return '';
 }
 
 function argNumber(arg: Arg | undefined): number {
@@ -173,7 +164,7 @@ function criteriaTest(criteria: unknown): (v: unknown) => boolean {
 	if (op === '=' || op === '<>') {
 		const re = wildcardRegExp(rhs);
 		return (v) =>
-			(isBlank(v) ? rhs === '' : re.test(String(v as string | number))) ===
+			(isBlank(v) ? rhs === '' : re.test(String(v))) ===
 			(op === '=');
 	}
 	const text = rhs.toLowerCase();
@@ -297,7 +288,7 @@ function isTrue(v: unknown): boolean {
 	if (isBlank(v)) return false;
 	if (typeof v === 'boolean') return v;
 	if (typeof v === 'number') return v !== 0;
-	const text = String(v as string).toUpperCase();
+	const text = String(v).toUpperCase();
 	if (text === 'TRUE') return true;
 	if (text === 'FALSE') return false;
 	throw LibFormulaError.VALUE;
@@ -620,7 +611,7 @@ function evaluateWithLibrary(
 		typeof out === 'boolean'
 	)
 		return roundResult(out);
-	return String(out);
+	return '#VALUE!';
 }
 
 function colToIndex(letters: string): number {

@@ -92,6 +92,14 @@ const IS_TOUCH: boolean =
 	(typeof window !== 'undefined' &&
 		window.matchMedia('(pointer: coarse)').matches);
 
+/** The text of a cell's source value, as it is shown for editing. */
+function sourceText(value: unknown): string {
+	if (typeof value === 'string') return value;
+	if (typeof value === 'number' || typeof value === 'boolean')
+		return String(value);
+	return '';
+}
+
 /** Handsontable theme that follows the active Obsidian theme (light/dark). */
 function handsontableThemeName(): string {
 	return document.body.classList.contains('theme-dark')
@@ -389,6 +397,7 @@ export class SheetView extends TextFileView {
 
 		this.buildFormulaBar();
 		this.buildToolbar();
+		this.applyToolbarScale();
 		this.installAutosave();
 		this.installRefreshTimer();
 		// Sync plugins that write through the vault are picked up right away, the timer covers the rest.
@@ -689,6 +698,7 @@ export class SheetView extends TextFileView {
 			this.installRefreshTimer();
 
 		if (!prev.autosave && s.autosave && this.dirty) this.requestSave();
+		this.applyToolbarScale();
 
 		if (
 			prev.defaultFontSize !== s.defaultFontSize ||
@@ -925,7 +935,7 @@ export class SheetView extends TextFileView {
 			return raw;
 		}
 		if (typeof raw === 'number' || typeof raw === 'boolean') return raw;
-		return String(raw);
+		return null;
 	}
 
 	/* ---------------- Grid lifecycle ---------------- */
@@ -1333,7 +1343,7 @@ export class SheetView extends TextFileView {
 		if (!hot || hot.isDestroyed) return null;
 		const td = (e.target as Element | null)?.closest?.('td');
 		if (!td || !this.gridEl.contains(td)) return null;
-		const coords = hot.getCoords(td as HTMLTableCellElement);
+		const coords = hot.getCoords(td);
 		const row = coords?.row ?? -1;
 		const col = coords?.col ?? -1;
 		return row < 0 || col < 0 ? null : { row, col };
@@ -1700,8 +1710,7 @@ export class SheetView extends TextFileView {
 		const cell = this.formulaEditCell ?? this.formulaCell;
 		if (!hot || hot.isDestroyed || !input || !cell) return;
 		const current = hot.getSourceDataAtCell(cell.row, cell.col);
-		const currentText =
-			current === null || current === undefined ? '' : String(current);
+		const currentText = sourceText(current);
 		if (input.value === currentText) return;
 		hot.setDataAtCell(
 			cell.row,
@@ -1741,6 +1750,17 @@ export class SheetView extends TextFileView {
 	}
 
 	/* ---------------- Toolbar ---------------- */
+
+	/** The toolbar size is a setting, separate for mobile and desktop. */
+	private applyToolbarScale(): void {
+		const s = this.plugin.settings;
+		const percent = Platform.isMobile
+			? s.toolbarScaleMobile
+			: s.toolbarScaleDesktop;
+		this.toolbarEl.setCssProps({
+			'--rtl-sheet-toolbar-zoom': String(percent / 100),
+		});
+	}
 
 	private buildToolbar(): void {
 		const tb = this.toolbarEl;
@@ -2254,7 +2274,7 @@ export class SheetView extends TextFileView {
 				cell && hot && !hot.isDestroyed
 					? hot.getSourceDataAtCell(cell.row, cell.col)
 					: null;
-			input.value = raw === null || raw === undefined ? '' : String(raw);
+			input.value = sourceText(raw);
 		}
 	}
 

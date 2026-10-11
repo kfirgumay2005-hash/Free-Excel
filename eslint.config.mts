@@ -29,4 +29,16 @@ export default defineConfig(
 		},
 	},
 	...obsidianmd.configs.recommended,
+	{
+		rules: {
+			// Excel and function names such as SUM keep their capitals.
+			'obsidianmd/ui/sentence-case': [
+				'warn',
+				{
+					enforceCamelCaseLower: true,
+					ignoreRegex: ['\\bExcel\\b', '\\bSUM\\b'],
+				},
+			],
+		},
+	},
 );

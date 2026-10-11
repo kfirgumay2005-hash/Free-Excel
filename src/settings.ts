@@ -11,6 +11,9 @@ export interface PluginSettings {
 	defaultColCount: number;
 	defaultFontSize: number;
 	enableFormulas: boolean;
+	/** Toolbar size in percent, on desktop and on mobile (phones and tablets). */
+	toolbarScaleDesktop: number;
+	toolbarScaleMobile: number;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -22,6 +25,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	defaultColCount: 26,
 	defaultFontSize: 14,
 	enableFormulas: true,
+	toolbarScaleDesktop: 100,
+	toolbarScaleMobile: 100,
 };
 
 function toInt(
@@ -74,6 +79,18 @@ export function sanitizeSettings(
 			36,
 		),
 		enableFormulas: !!s.enableFormulas,
+		toolbarScaleDesktop: toInt(
+			s.toolbarScaleDesktop,
+			DEFAULT_SETTINGS.toolbarScaleDesktop,
+			50,
+			150,
+		),
+		toolbarScaleMobile: toInt(
+			s.toolbarScaleMobile,
+			DEFAULT_SETTINGS.toolbarScaleMobile,
+			50,
+			150,
+		),
 	};
 }
 
@@ -193,6 +210,34 @@ export class SettingsTab extends PluginSettingTab {
 						name: 'Enable formulas',
 						desc: 'Evaluate cells that start with "=" (SUM, AVERAGE, COUNT, MIN, MAX, IF and many more). Applies to all open sheets immediately.',
 						control: { type: 'toggle', key: 'enableFormulas' },
+					},
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Toolbar',
+				items: [
+					{
+						name: 'Toolbar size on desktop (%)',
+						desc: 'Size of the toolbar buttons on computers and laptops. Applies to all open sheets immediately.',
+						control: {
+							type: 'slider',
+							key: 'toolbarScaleDesktop',
+							min: 50,
+							max: 150,
+							step: 5,
+						},
+					},
+					{
+						name: 'Toolbar size on mobile (%)',
+						desc: 'Size of the toolbar buttons on phones and tablets. A smaller toolbar shows more buttons without scrolling.',
+						control: {
+							type: 'slider',
+							key: 'toolbarScaleMobile',
+							min: 50,
+							max: 150,
+							step: 5,
+						},
 					},
 				],
 			},
