@@ -6,6 +6,23 @@ import {
 } from 'obsidian';
 import type RtlSpreadsheetPlugin from './main';
 
+/** Opens Settings > Hotkeys filtered to this plugin's commands (internal API, so every step is optional). */
+function openHotkeySettings(app: App): void {
+	const setting = (
+		app as unknown as {
+			setting?: { openTabById?: (id: string) => unknown };
+		}
+	).setting;
+	const tab = setting?.openTabById?.('hotkeys') as
+		| {
+				searchComponent?: { setValue(value: string): void };
+				updateHotkeyVisibility?: () => void;
+		  }
+		| undefined;
+	tab?.searchComponent?.setValue('Free-Excel');
+	tab?.updateHotkeyVisibility?.();
+}
+
 export interface PluginSettings {
 	autosave: boolean;
 	autosaveDelayMs: number;
@@ -26,6 +43,8 @@ export interface PluginSettings {
 	/** Colors saved in the toolbar for one-click use, as "#rrggbb" (managed from the toolbar). */
 	savedFillColors: string[];
 	savedTextColors: string[];
+	/** Ctrl+G (Cmd+G) opens the find bar of the active sheet instead of Obsidian's graph view. */
+	ctrlGFind: boolean;
 }
 
 /** How many colors can be saved for the fill, and how many for the text. */
@@ -46,6 +65,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	selectionHandles: 'four',
 	savedFillColors: [],
 	savedTextColors: [],
+	ctrlGFind: false,
 };
 
 function toColors(value: unknown): string[] {
@@ -128,6 +148,7 @@ export function sanitizeSettings(
 		selectionHandles: s.selectionHandles === 'two' ? 'two' : 'four',
 		savedFillColors: toColors(s.savedFillColors),
 		savedTextColors: toColors(s.savedTextColors),
+		ctrlGFind: !!s.ctrlGFind,
 	};
 }
 
@@ -247,6 +268,28 @@ export class SettingsTab extends PluginSettingTab {
 						name: 'Enable formulas',
 						desc: 'Evaluate cells that start with "=" (SUM, AVERAGE, COUNT, MIN, MAX, IF and many more). Applies to all open sheets immediately.',
 						control: { type: 'toggle', key: 'enableFormulas' },
+					},
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Keyboard',
+				items: [
+					{
+						name: 'Ctrl+G finds in the sheet',
+						desc: 'While a spreadsheet is active, Ctrl+G (Cmd+G on macOS) opens the find bar instead of the graph view. Everywhere else Ctrl+G keeps opening the graph view.',
+						control: { type: 'toggle', key: 'ctrlGFind' },
+					},
+					{
+						name: 'Custom find shortcut',
+						desc: 'Prefer another key? Assign any shortcut to the "Find in spreadsheet" command in Settings > Hotkeys.',
+						render: (setting) => {
+							setting.addButton((btn) =>
+								btn
+									.setButtonText('Open hotkeys')
+									.onClick(() => openHotkeySettings(this.app)),
+							);
+						},
 					},
 				],
 			},

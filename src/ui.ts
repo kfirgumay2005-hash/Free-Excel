@@ -579,3 +579,98 @@ export class ColumnFilterModal extends Modal {
 		this.contentEl.empty();
 	}
 }
+
+/** Asks for one line of text (such as a new sheet name). `validate` returns an error message or null. */
+export class TextPromptModal extends Modal {
+	private value: string;
+
+	constructor(
+		app: App,
+		private readonly heading: string,
+		initial: string,
+		private readonly validate: (value: string) => string | null,
+		private readonly onSubmit: (value: string) => void,
+	) {
+		super(app);
+		this.value = initial;
+	}
+
+	onOpen(): void {
+		this.setTitle(this.heading);
+		const { contentEl } = this;
+		contentEl.empty();
+		const error = contentEl.createDiv({ cls: 'rtl-sheet-prompt-error' });
+		const submit = (): void => {
+			const message = this.validate(this.value);
+			if (message) {
+				error.setText(message);
+				return;
+			}
+			this.close();
+			this.onSubmit(this.value);
+		};
+		new Setting(contentEl).addText((text) => {
+			text.setValue(this.value).onChange((value) => {
+				this.value = value;
+				error.setText('');
+			});
+			text.inputEl.addClass('rtl-sheet-prompt-input');
+			text.inputEl.setAttr('dir', 'auto');
+			text.inputEl.addEventListener('keydown', (e) => {
+				if (e.key === 'Enter' && !e.isComposing) {
+					e.preventDefault();
+					submit();
+				}
+			});
+			window.setTimeout(() => text.inputEl.select(), 0);
+		});
+		new Setting(contentEl)
+			.addButton((btn) =>
+				btn.setButtonText('Save').setCta().onClick(submit),
+			)
+			.addButton((btn) =>
+				btn.setButtonText('Cancel').onClick(() => this.close()),
+			);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+/** Asks before something that cannot be undone. */
+export class ConfirmModal extends Modal {
+	constructor(
+		app: App,
+		private readonly heading: string,
+		private readonly message: string,
+		private readonly confirmText: string,
+		private readonly onConfirm: () => void,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.setTitle(this.heading);
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl('p', { text: this.message });
+		new Setting(contentEl)
+			.addButton((btn) =>
+				btn
+					.setButtonText(this.confirmText)
+					.setDestructive()
+					.onClick(() => {
+						this.close();
+						this.onConfirm();
+					}),
+			)
+			.addButton((btn) =>
+				btn.setButtonText('Cancel').onClick(() => this.close()),
+			);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}

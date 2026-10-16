@@ -59,8 +59,74 @@ export interface MergeInfo {
 	colspan: number;
 }
 
+export type LegendPosition = 'bottom' | 'top' | 'right' | 'none';
+
+export interface AxisStyle {
+	title?: string;
+	/** Fixed ends of a numeric axis; missing = from the data. */
+	min?: number;
+	max?: number;
+	/** Missing = shown. */
+	showLabels?: boolean;
+}
+
+export interface SeriesStyle {
+	color?: string;
+	/** Scatter charts; missing = the chart's own trendline setting. */
+	trendline?: boolean;
+	trendColor?: string;
+}
+
+/** Chart types that can be inserted from the toolbar. */
+export type ChartType = 'column' | 'bar' | 'line' | 'pie' | 'scatter';
+
+export interface ChartSpec {
+	id: string;
+	type: ChartType;
+	title: string;
+	/** The cells the chart shows (0-based, inclusive); the Y values of a scatter chart. */
+	range: SelRange;
+	/** Scatter charts: the X values (when missing, the first column of `range` holds them). */
+	xRange?: SelRange;
+	/** The first row of the range holds the series names. */
+	headerRow: boolean;
+	/** Scatter charts: a linear trendline for every series. */
+	trendline: boolean;
+	/** Color of the trendline ("#rrggbb"); missing = the color of its series. */
+	trendColor?: string;
+	/** Trendline text in the legend. Missing = shown. */
+	showEquation?: boolean;
+	showR2?: boolean;
+	/* Look (Customize tab of the chart editor). Missing values use the defaults. */
+	bg?: string;
+	fontSize?: number;
+	titleColor?: string;
+	pointSize?: number;
+	lineWidth?: number;
+	/** Pie charts: size of the hole in the middle, in percent of the radius (0 = a full pie). */
+	donutHole?: number;
+	legend?: LegendPosition;
+	/** The axes as they are drawn: horizontal (bottom) and vertical (left). */
+	xAxis?: AxisStyle;
+	yAxis?: AxisStyle;
+	/** Lines across the plot at the value ticks (default on). */
+	gridlines?: boolean;
+	/** Scatter charts: lines at the X ticks too (default off). */
+	xGridlines?: boolean;
+	gridColor?: string;
+	/** Per series (per slice for pie charts): color and trendline. */
+	series?: SeriesStyle[];
+	/** Position and size in px at 100% zoom, measured from the top-left corner of cell A1. */
+	x: number;
+	y: number;
+	w: number;
+	h: number;
+}
+
 export interface SheetModel {
 	version: number;
+	/** The name on the sheet's tab (unique within the file). */
+	name: string;
 	data: Scalar[][];
 	cellFormats: Record<string, CellFormat>;
 	/** "row,col" -> vault path of an image shown inside the cell. */
@@ -72,7 +138,18 @@ export interface SheetModel {
 	colWidths: (number | null)[];
 	rowHeights: (number | null)[];
 	rtl: boolean;
+	charts: ChartSpec[];
 }
+
+/** A file holds one or more sheets (tabs). */
+export interface WorkbookModel {
+	sheets: SheetModel[];
+	/** Index of the sheet that was shown when the file was saved. */
+	active: number;
+}
+
+/** File format version that stores several sheets. Older files hold one sheet at the top level. */
+export const WORKBOOK_VERSION = 3;
 
 /** A normalized (0-based, inclusive, top-left to bottom-right) selection range. */
 export interface SelRange {
@@ -131,9 +208,11 @@ export function rowBaseHeight(fontSizePx: number): number {
 export function createDefaultModel(
 	s: PluginSettings,
 	rtl: boolean,
+	name = 'Sheet1',
 ): SheetModel {
 	return {
 		version: 2,
+		name,
 		data: Array.from({ length: s.defaultRowCount }, () =>
 			Array<Scalar>(s.defaultColCount).fill(null),
 		),
@@ -144,11 +223,44 @@ export function createDefaultModel(
 		colWidths: [],
 		rowHeights: [],
 		rtl,
+		charts: [],
 	};
 }
 
-export function serializeModel(model: SheetModel): string {
-	return JSON.stringify(model);
+export function serializeWorkbook(wb: WorkbookModel): string {
+	return JSON.stringify({
+		version: WORKBOOK_VERSION,
+		active: wb.active,
+		sheets: wb.sheets,
+	});
+}
+
+/** Characters that Excel does not allow in sheet names, plus the quote used in references. */
+const SHEET_NAME_INVALID = /[\\/?*[\]:'!]/g;
+
+export function cleanSheetName(name: string): string {
+	return name.replace(SHEET_NAME_INVALID, ' ').replace(/\s+/g, ' ').trim().slice(0, 31);
+}
+
+/** "Sheet2", "Sheet3", ... or "Name (2)": the first name that no sheet uses yet. */
+export function uniqueSheetName(taken: string[], base: string): string {
+	const used = new Set(taken.map((n) => n.toLowerCase()));
+	if (!used.has(base.toLowerCase())) return base;
+	const numbered = /^(.*?)(\d+)$/.exec(base);
+	for (let n = 2; ; n++) {
+		const candidate = numbered
+			? `${numbered[1] ?? ''}${n}`
+			: `${base} (${n})`;
+		if (!used.has(candidate.toLowerCase())) return candidate;
+	}
+}
+
+/** How a sheet is named inside a formula: quoted when it is not a plain word. */
+export function sheetRefName(name: string): string {
+	return /^[A-Za-z_][A-Za-z0-9_.]*$/.test(name) &&
+		!/^[A-Za-z]{1,3}\d+$/.test(name)
+		? name
+		: `'${name}'`;
 }
 
 export function isEmptyFormat(f: CellFormat): boolean {

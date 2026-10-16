@@ -1,10 +1,13 @@
 import {
 	debounce,
+	KeymapEventHandler,
 	Menu,
 	Notice,
 	Platform,
 	Plugin,
+	Scope,
 	TFile,
+	TFolder,
 	TextFileView,
 	WorkspaceLeaf,
 	normalizePath,
@@ -25,6 +28,7 @@ import {
 import {
 	CellBorders,
 	CellFormat,
+	ChartSpec,
 	ColumnFilter,
 	DEFAULT_COL_WIDTH,
 	FONT_SIZES,
@@ -35,6 +39,8 @@ import {
 	Scalar,
 	SelRange,
 	SheetModel,
+	WorkbookModel,
+	cleanSheetName,
 	cloneFormat,
 	MAX_ZOOM,
 	MIN_ZOOM,
@@ -48,8 +54,22 @@ import {
 	isEmptyFormat,
 	key,
 	rowBaseHeight,
-	serializeModel,
+	serializeWorkbook,
+	sheetRefName,
+	uniqueSheetName,
 } from './model';
+import {
+	CHART_DEFAULT_H,
+	CHART_DEFAULT_W,
+	CHART_HEAD_H,
+	CHART_MIN_H,
+	CHART_MIN_W,
+	CHART_TYPES,
+	ChartEditor,
+	guessHeaderRow,
+	readChartData,
+	renderChart,
+} from './charts';
 import {
 	FormulaFunctionInfo,
 	buildFunctionCall,
@@ -63,11 +83,13 @@ import {
 import { ImportedSheet, parseCsv, parseXlsx } from './xlsx';
 import {
 	ColumnFilterModal,
+	ConfirmModal,
 	FormulaAutocomplete,
 	FunctionPickerModal,
 	ImportChoice,
 	ImportDirectionModal,
 	ImportPrompt,
+	TextPromptModal,
 	VaultFilePickerModal,
 } from './ui';
 
@@ -90,9 +112,9 @@ const IMAGE_CORNERS = ['nw', 'ne', 'sw', 'se'] as const;
 const SEL_SCROLL_EDGE = 36;
 /** Px scrolled per frame while a selection handle is held near an edge. */
 const SEL_SCROLL_STEP = 8;
-/** Extra px added to measured text when a column is widened to fit it. */
-const EXPAND_PADDING = 18;
-const MAX_EXPAND_WIDTH = 600;
+/** Extra px added to measured text when a column is widened to fit it (cell padding, border, rounding). */
+const EXPAND_PADDING = 24;
+const MAX_EXPAND_WIDTH = 3000;
 /** Horizontal padding inside a cell, used when measuring text. */
 const CELL_PADDING = 8;
 
@@ -247,6 +269,34 @@ export default class RtlSpreadsheetPlugin extends Plugin {
 			},
 		});
 
+		// "New spreadsheet" next to "New note" and "New canvas" in the file explorer menu.
+		this.registerEvent(
+			this.app.workspace.on('file-menu', (menu, file) => {
+				const folder = file instanceof TFolder ? file : file.parent;
+				if (!folder) return;
+				menu.addItem((item) =>
+					item
+						.setTitle('New spreadsheet')
+						.setIcon('table')
+						.setSection('action-primary')
+						.onClick(() => {
+							void this.createNewSheet(folder);
+						}),
+				);
+			}),
+		);
+
+		this.addCommand({
+			id: 'find-in-active-sheet',
+			name: 'Find in spreadsheet',
+			checkCallback: (checking) => {
+				const view = this.app.workspace.getActiveViewOfType(SheetView);
+				if (!view) return false;
+				if (!checking) view.openFind();
+				return true;
+			},
+		});
+
 		this.addCommand({
 			id: 'save-active-sheet',
 			name: 'Save active spreadsheet',
@@ -329,12 +379,13 @@ export default class RtlSpreadsheetPlugin extends Plugin {
 		new Notice(`${message}: ${detail}`);
 	}
 
-	async createNewSheet(): Promise<void> {
+	/** Creates a sheet file in `folder`, or where Obsidian puts new notes. */
+	async createNewSheet(target?: TFolder): Promise<void> {
 		try {
 			const active = this.app.workspace.getActiveFile();
-			const folder = this.app.fileManager.getNewFileParent(
-				active?.path ?? '',
-			);
+			const folder =
+				target ??
+				this.app.fileManager.getNewFileParent(active?.path ?? '');
 			let path = normalizePath(
 				`${folder.path}/Untitled sheet.${this.sheetExt}`,
 			);
@@ -346,9 +397,12 @@ export default class RtlSpreadsheetPlugin extends Plugin {
 			}
 			const file = await this.app.vault.create(
 				path,
-				serializeModel(
-					createDefaultModel(this.settings, defaultSheetRtl()),
-				),
+				serializeWorkbook({
+					sheets: [
+						createDefaultModel(this.settings, defaultSheetRtl()),
+					],
+					active: 0,
+				}),
 			);
 			await this.app.workspace.getLeaf(true).openFile(file);
 		} catch (e) {
@@ -362,6 +416,18 @@ export default class RtlSpreadsheetPlugin extends Plugin {
 /* ------------------------------------------------------------------ */
 
 const baseTextRenderer = Handsontable.renderers.getRenderer('text');
+
+const CHART_ICONS: Record<ChartSpec['type'], string> = {
+	column: 'chart-column',
+	bar: 'chart-bar',
+	line: 'chart-line',
+	pie: 'chart-pie',
+	scatter: 'chart-scatter',
+};
+
+function newChartId(): string {
+	return `chart-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 /** The color pickers in the toolbar; fill and text also have saved colors. */
 type ColorKind = 'fill' | 'text' | 'border';
@@ -427,6 +493,8 @@ interface SideState {
 	imageSizes: Record<string, ImageSizeRecord>;
 	/** As JSON: these records are changed in place. */
 	widenRecords: string;
+	/** As JSON: a chart is moved by changing its position. */
+	charts: string;
 	colWidths: (number | null)[];
 	rowHeights: (number | null)[];
 }
@@ -456,6 +524,7 @@ function sameSideState(a: SideState, b: SideState): boolean {
 		sameRecord(a.images, b.images) &&
 		sameRecord(a.imageSizes, b.imageSizes) &&
 		a.widenRecords === b.widenRecords &&
+		a.charts === b.charts &&
 		sameSizes(a.colWidths, b.colWidths) &&
 		sameSizes(a.rowHeights, b.rowHeights)
 	);
@@ -471,9 +540,39 @@ interface RowsSnapshot {
 	heights: (number | null)[];
 }
 
+/** How far a cell's text spills past its own cell. */
+interface SpillInfo {
+	visualRight: boolean;
+	/** Px (zoomed) the text reaches past its own cell. */
+	extra: number;
+}
+
+/** The spills of one row, and the columns whose inline-end grid line spilled text crosses. */
+interface RowSpill {
+	spills: Map<number, SpillInfo>;
+	crossed: Set<number>;
+}
+
 export class SheetView extends TextFileView {
 	private plugin: RtlSpreadsheetPlugin;
+	/** The sheet that is shown: always `sheets[activeSheet]`. */
 	private model: SheetModel;
+	/** Every sheet (tab) of the file. */
+	private sheets: SheetModel[];
+	private activeSheet = 0;
+	private tabBarEl: HTMLElement;
+	/** Charts of the shown sheet, drawn inside the scrolled part of the grid. */
+	private chartLayer: HTMLElement | null = null;
+	private chartFrame = 0;
+	/** Panel above the grid where a chart is created or changed. */
+	private chartPanelEl: HTMLElement;
+	private chartEditor: ChartEditor | null = null;
+	/** The chart that the editor changes. */
+	private chartEditorId: string | null = null;
+	/** The ranges in the chart editor, outlined in the sheet. */
+	private chartPickRanges: SelRange[] = [];
+	/** Ctrl+G, registered in the view's scope while the setting is on. */
+	private findHotkey: KeymapEventHandler | null = null;
 	private hot: Handsontable | null = null;
 	/** Grid instance used for formula lookups while Handsontable is still constructing. */
 	private gridForCalc: Handsontable.Core | null = null;
@@ -553,6 +652,8 @@ export class SheetView extends TextFileView {
 	private formulaCache = new Map<string, { raw: string; value: Scalar }>();
 	/** Counts evaluations that were cut short by the depth limit; such results are not cached. */
 	private formulaLimitHits = 0;
+	/** Spilled text by row, kept until the sheet changes (like the formula results). */
+	private spillCache = new Map<number, RowSpill>();
 	private fontFamilyCache: string | null = null;
 	private measureCtx: CanvasRenderingContext2D | null = null;
 
@@ -560,7 +661,11 @@ export class SheetView extends TextFileView {
 		super(leaf);
 		this.plugin = plugin;
 		this.model = createDefaultModel(plugin.settings, defaultSheetRtl());
+		this.sheets = [this.model];
 		this.appliedSettings = { ...plugin.settings };
+		// Hotkeys registered here win over Obsidian's while this view has the focus.
+		this.scope = new Scope(this.app.scope);
+		this.applyShortcutSettings();
 
 		this.contentEl.empty();
 		this.contentEl.addClass('rtl-spreadsheet-view');
@@ -573,7 +678,20 @@ export class SheetView extends TextFileView {
 		this.findBarEl = this.contentEl.createDiv({
 			cls: 'rtl-sheet-find-bar',
 		});
-		this.gridEl = this.contentEl.createDiv({ cls: 'rtl-sheet-grid' });
+		this.chartPanelEl = this.contentEl.createDiv({
+			cls: 'rtl-sheet-chart-panel',
+		});
+		this.chartPanelEl.hide();
+		// Like the formula bar: typing in the panel must not reach the grid.
+		this.chartPanelEl.addEventListener('focusin', (e) => {
+			if (e.target instanceof HTMLElement && isTextEntry(e.target))
+				this.hot?.unlisten();
+		});
+		// The grid and, next to it, the chart editor (below it on narrow screens).
+		const body = this.contentEl.createDiv({ cls: 'rtl-sheet-body' });
+		this.gridEl = body.createDiv({ cls: 'rtl-sheet-grid' });
+		body.appendChild(this.chartPanelEl);
+		this.tabBarEl = this.contentEl.createDiv({ cls: 'rtl-sheet-tabs' });
 
 		this.buildFormulaBar();
 		this.buildToolbar();
@@ -756,7 +874,10 @@ export class SheetView extends TextFileView {
 
 	getViewData(): string {
 		this.captureGridState();
-		return serializeModel(this.model);
+		return serializeWorkbook({
+			sheets: this.sheets,
+			active: this.activeSheet,
+		});
 	}
 
 	setViewData(data: string, clear: boolean): void {
@@ -773,14 +894,28 @@ export class SheetView extends TextFileView {
 					);
 				}
 			}
-			const next = this.normalizeModel(parsed);
+			const next = this.normalizeWorkbook(parsed);
 			this.diskData = data;
 			if (clear) this.filters.clear(); // another file: its columns mean something else
+			// Same file with the same tabs: stay on the sheet that is shown.
+			const sameTabs =
+				!clear &&
+				next.sheets.length === this.sheets.length &&
+				next.sheets.every((sh, i) => sh.name === this.sheets[i]?.name);
+			const index = sameTabs ? this.activeSheet : next.active;
+			const shown = next.sheets[index] ?? next.sheets[0];
+			if (!shown) return;
 			// Same file, new content: update the live grid so selection and scroll stay put.
-			if (clear || !this.applyModelInPlace(next)) {
+			if (sameTabs && this.applyModelInPlace(shown)) {
+				this.sheets = next.sheets;
+				this.renderTabs();
+			} else {
 				// Drop the old grid first, rebuildGrid() would copy its stale cells into the new model.
 				this.destroyGrid();
-				this.model = next;
+				if (!sameTabs) this.filters.clear();
+				this.sheets = next.sheets;
+				this.activeSheet = next.sheets.indexOf(shown);
+				this.model = shown;
 				this.rebuildGrid();
 			}
 			this.dirty = false;
@@ -796,6 +931,8 @@ export class SheetView extends TextFileView {
 			this.plugin.settings,
 			defaultSheetRtl(),
 		);
+		this.sheets = [this.model];
+		this.activeSheet = 0;
 		this.dirty = false;
 	}
 
@@ -820,6 +957,7 @@ export class SheetView extends TextFileView {
 			this.plugin.reportError('Could not save sheet on close', e);
 		}
 		window.clearInterval(this.refreshTimer);
+		window.cancelAnimationFrame(this.chartFrame);
 		this.autocomplete.destroy();
 		this.destroyGrid();
 	}
@@ -919,6 +1057,7 @@ export class SheetView extends TextFileView {
 			this.installRefreshTimer();
 
 		if (!prev.autosave && s.autosave && this.dirty) this.requestSave();
+		if (prev.ctrlGFind !== s.ctrlGFind) this.applyShortcutSettings();
 		this.applyToolbarScale();
 		this.applySelectionHandleSettings();
 		this.renderPalette('fill');
@@ -934,6 +1073,81 @@ export class SheetView extends TextFileView {
 	}
 
 	/* ---------------- Model helpers ---------------- */
+
+	/** Reads a file: several sheets (version 3), or one sheet at the top level (older files). */
+	private normalizeWorkbook(raw: unknown): WorkbookModel {
+		const r = (raw && typeof raw === 'object' ? raw : {}) as {
+			sheets?: unknown;
+			active?: unknown;
+		};
+		const list: unknown[] =
+			Array.isArray(r.sheets) && r.sheets.length > 0 ? r.sheets : [raw];
+		const sheets: SheetModel[] = [];
+		for (const item of list) {
+			const sheet = this.normalizeModel(item);
+			// Every tab needs a name of its own: formulas refer to sheets by name.
+			sheet.name = uniqueSheetName(
+				sheets.map((sh) => sh.name),
+				sheet.name || `Sheet${sheets.length + 1}`,
+			);
+			sheets.push(sheet);
+		}
+		const active = Math.round(Number(r.active));
+		return {
+			sheets,
+			active:
+				Number.isFinite(active) && active >= 0 && active < sheets.length
+					? active
+					: 0,
+		};
+	}
+
+	private normalizeCharts(raw: unknown): ChartSpec[] {
+		if (!Array.isArray(raw)) return [];
+		const num = (v: unknown, fallback: number): number =>
+			typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+		const types: string[] = ['column', 'bar', 'line', 'pie', 'scatter'];
+		const out: ChartSpec[] = [];
+		for (const item of raw as (Partial<ChartSpec> | null)[]) {
+			if (!item || typeof item !== 'object' || !item.range) continue;
+			const rg = item.range;
+			const xr = item.xRange;
+			out.push({
+				id: typeof item.id === 'string' ? item.id : newChartId(),
+				type: types.includes(item.type ?? '')
+					? (item.type as ChartSpec['type'])
+					: 'column',
+				title: typeof item.title === 'string' ? item.title : '',
+				range: {
+					r1: Math.max(0, num(rg.r1, 0)),
+					c1: Math.max(0, num(rg.c1, 0)),
+					r2: Math.max(0, num(rg.r2, 0)),
+					c2: Math.max(0, num(rg.c2, 0)),
+				},
+				xRange:
+					xr && typeof xr === 'object'
+						? {
+								r1: Math.max(0, num(xr.r1, 0)),
+								c1: Math.max(0, num(xr.c1, 0)),
+								r2: Math.max(0, num(xr.r2, 0)),
+								c2: Math.max(0, num(xr.c2, 0)),
+							}
+						: undefined,
+				headerRow: !!item.headerRow,
+				trendline: !!item.trendline,
+				trendColor:
+					typeof item.trendColor === 'string' &&
+					/^#[0-9a-f]{6}$/i.test(item.trendColor)
+						? item.trendColor
+						: undefined,
+				x: Math.max(0, num(item.x, 0)),
+				y: Math.max(0, num(item.y, 0)),
+				w: Math.max(CHART_MIN_W, num(item.w, CHART_DEFAULT_W)),
+				h: Math.max(CHART_MIN_H, num(item.h, CHART_DEFAULT_H)),
+			});
+		}
+		return out;
+	}
 
 	private normalizeModel(raw: unknown): SheetModel {
 		const base = createDefaultModel(
@@ -958,7 +1172,8 @@ export class SheetView extends TextFileView {
 		}
 
 		return {
-			version: typeof r.version === 'number' ? r.version : 2,
+			version: 2,
+			name: typeof r.name === 'string' ? cleanSheetName(r.name) : '',
 			data,
 			cellFormats:
 				r.cellFormats && typeof r.cellFormats === 'object'
@@ -977,6 +1192,7 @@ export class SheetView extends TextFileView {
 			colWidths: Array.isArray(r.colWidths) ? r.colWidths : [],
 			rowHeights: Array.isArray(r.rowHeights) ? r.rowHeights : [],
 			rtl: typeof r.rtl === 'boolean' ? r.rtl : defaultSheetRtl(),
+			charts: this.normalizeCharts(r.charts),
 		};
 	}
 
@@ -1019,6 +1235,8 @@ export class SheetView extends TextFileView {
 		this.undoPlugin()?.clear();
 		this.resetSideBaseline();
 		hot.render();
+		this.queueCharts();
+		this.chartEditor?.refresh();
 		this.refreshToolbarState();
 		return true;
 	}
@@ -1110,6 +1328,36 @@ export class SheetView extends TextFileView {
 		this.model.cellFormats = remap(this.model.cellFormats);
 		this.model.images = remap(this.model.images);
 		this.model.imageSizes = remap(this.model.imageSizes);
+		// Charts keep showing the same cells (replaced, not changed: undo compares them).
+		const shiftRange = (rg: SelRange): SelRange => {
+			const lo = axis === 'row' ? rg.r1 : rg.c1;
+			const hi = axis === 'row' ? rg.r2 : rg.c2;
+			let a = lo;
+			let b = hi;
+			if (mode === 'insert') {
+				if (index <= lo) a += amount;
+				if (index <= hi) b += amount;
+			} else {
+				const end = index + amount; // first index after the removed ones
+				const shift = (p: number): number =>
+					p < index ? p : p >= end ? p - amount : index;
+				a = shift(lo);
+				// The last cell moves back to the last one that is left before it.
+				b = hi < index ? hi : hi >= end ? hi - amount : index - 1;
+				if (b < a) b = a;
+			}
+			if (a === lo && b === hi) return rg;
+			return axis === 'row'
+				? { ...rg, r1: a, r2: b }
+				: { ...rg, c1: a, c2: b };
+		};
+		this.model.charts = this.model.charts.map((chart) => {
+			const range = shiftRange(chart.range);
+			const xRange = chart.xRange && shiftRange(chart.xRange);
+			return range === chart.range && xRange === chart.xRange
+				? chart
+				: { ...chart, range, xRange };
+		});
 	}
 
 	private spliceSizes(
@@ -1126,12 +1374,35 @@ export class SheetView extends TextFileView {
 
 	/* ---------------- Formula resolution ---------------- */
 
-	/** `at` is the cell the value lives in (ROW() and COLUMN() without an argument report it). */
+	/** The stored value of a cell on any sheet of the file (the shown one is read from the grid). */
+	private rawCell(sheet: number, row: number, col: number): unknown {
+		if (sheet === this.activeSheet) {
+			const hot: Handsontable.Core | null = this.gridForCalc ?? this.hot;
+			if (hot && !hot.isDestroyed) return hot.getSourceDataAtCell(row, col);
+		}
+		return this.sheets[sheet]?.data[row]?.[col] ?? null;
+	}
+
+	/** Index of the sheet a formula names ("Sheet2" or "'My sheet'"), or -1. */
+	private sheetIndexByName(name: string): number {
+		const wanted = name
+			.replace(/^'(.*)'$/, '$1')
+			.replace(/''/g, "'")
+			.trim()
+			.toLowerCase();
+		return this.sheets.findIndex((s) => s.name.toLowerCase() === wanted);
+	}
+
+	/**
+	 * `at` is the cell the value lives in (ROW() and COLUMN() without an argument report it),
+	 * `sheet` the index of its sheet (the shown one by default).
+	 */
 	private resolveRaw(
 		raw: unknown,
 		depth: number,
 		coerce: boolean,
 		at?: { row: number; col: number },
+		sheet = this.activeSheet,
 	): Scalar {
 		if (raw === undefined || raw === null) return null;
 		if (typeof raw === 'string') {
@@ -1144,7 +1415,7 @@ export class SheetView extends TextFileView {
 					this.formulaLimitHits++;
 					return '#CYCLE!';
 				}
-				const cacheKey = at ? key(at.row, at.col) : null;
+				const cacheKey = at ? `${sheet}!${key(at.row, at.col)}` : null;
 				if (cacheKey) {
 					const hit = this.formulaCache.get(cacheKey);
 					if (hit && hit.raw === raw) return hit.value;
@@ -1152,17 +1423,19 @@ export class SheetView extends TextFileView {
 				const limitHits = this.formulaLimitHits;
 				const value = evaluateFormula(
 					raw,
-					(r, c) => {
-						const hot: Handsontable.Core | null =
-							this.gridForCalc ?? this.hot;
-						const cellRaw =
-							hot && !hot.isDestroyed
-								? hot.getSourceDataAtCell(r, c)
-								: null;
-						return this.resolveRaw(cellRaw, depth + 1, true, {
-							row: r,
-							col: c,
-						});
+					(r, c, sheetName) => {
+						const target =
+							sheetName === undefined
+								? sheet
+								: this.sheetIndexByName(sheetName);
+						if (target < 0) return '#REF!';
+						return this.resolveRaw(
+							this.rawCell(target, r, c),
+							depth + 1,
+							true,
+							{ row: r, col: c },
+							target,
+						);
 					},
 					at,
 				);
@@ -1181,11 +1454,13 @@ export class SheetView extends TextFileView {
 	/* ---------------- Grid lifecycle ---------------- */
 
 	destroyGrid(): void {
+		this.closeChartEditor();
 		this.clearRefPick();
 		this.autocomplete.detach();
 		if (this.hot && !this.hot.isDestroyed) this.hot.destroy();
 		this.hot = null;
 		this.gridForCalc = null;
+		this.chartLayer = null;
 		this.gridEl.empty();
 	}
 
@@ -1278,6 +1553,11 @@ export class SheetView extends TextFileView {
 					if (!isForced) return;
 					this.rowHeightCache.clear();
 					this.formulaCache.clear();
+					this.spillCache.clear();
+				},
+				// Charts follow their data: draw them again after every full render.
+				afterRender: (isForced) => {
+					if (isForced) this.queueCharts();
 				},
 				afterChange: (changes, source) => {
 					this.invalidateRowSizes();
@@ -1389,6 +1669,11 @@ export class SheetView extends TextFileView {
 			// The first render ran before `this.hot` existed; render again so formulas see all cells.
 			if (this.plugin.settings.enableFormulas) this.hot.render();
 			this.installSelectionHandles(this.hot);
+			this.chartLayer =
+				this.gridEl
+					.querySelector('.ht_master .wtHider')
+					?.createDiv({ cls: 'rtl-sheet-chart-layer' }) ?? null;
+			this.queueCharts();
 			this.formulaCell = null;
 			const undo = this.undoPlugin();
 			if (history && undo) {
@@ -1405,6 +1690,7 @@ export class SheetView extends TextFileView {
 		} catch (e) {
 			this.plugin.reportError('Could not create the spreadsheet grid', e);
 		}
+		this.renderTabs();
 	}
 
 	private copyFormatsOnFill(
@@ -1449,6 +1735,7 @@ export class SheetView extends TextFileView {
 		this.rowIndex = null;
 		this.rowHeightCache.clear();
 		this.formulaCache.clear();
+		this.spillCache.clear();
 	}
 
 	private getRowIndex(): Map<number, number[]> {
@@ -1584,12 +1871,18 @@ export class SheetView extends TextFileView {
 		return total;
 	}
 
+	/**
+	 * The font the cells are drawn with. Handsontable's theme sets its own font on the grid,
+	 * so it is read from there: measuring with Obsidian's font gave widths that were too small.
+	 */
 	private fontFamily(): string {
-		if (!this.fontFamilyCache) {
-			this.fontFamilyCache =
-				getComputedStyle(this.gridEl).fontFamily || 'sans-serif';
-		}
-		return this.fontFamilyCache;
+		if (this.fontFamilyCache) return this.fontFamilyCache;
+		const grid = this.gridEl.querySelector('.handsontable');
+		const family =
+			getComputedStyle(grid ?? this.gridEl).fontFamily || 'sans-serif';
+		// Before the grid exists the font is not final: do not keep it.
+		if (grid) this.fontFamilyCache = family;
+		return family;
 	}
 
 	/** Width of text in unzoomed px. */
@@ -1823,9 +2116,6 @@ export class SheetView extends TextFileView {
 			'rtl-sheet-find-current',
 			!!found && found.row === row && found.col === col,
 		);
-		td.querySelectorAll('.rtl-sheet-spill-eraser').forEach((el) =>
-			el.remove(),
-		);
 
 		const f = this.model.cellFormats[key(row, col)];
 		const imagePath = this.model.images[key(row, col)];
@@ -1860,6 +2150,11 @@ export class SheetView extends TextFileView {
 		st.position = '';
 		st.zIndex = '';
 		st.clipPath = '';
+		// Text that spills over this cell hides the grid line it crosses (like Google Sheets).
+		// The border keeps its width, so the columns do not move; only its color goes.
+		st.borderInlineEndColor = this.rowSpill(instance, row).crossed.has(col)
+			? 'transparent'
+			: '';
 		applyBorderStyles(st, f?.borders);
 
 		if (imagePath) {
@@ -1872,7 +2167,7 @@ export class SheetView extends TextFileView {
 		} else if (f?.rotate) {
 			this.renderRotated(td, text, f.rotate);
 		} else if (wrap === 'overflow') {
-			const spill = this.spillInfo(instance, row, col, text, isNumber, f);
+			const spill = this.rowSpill(instance, row).spills.get(col);
 			if (spill) {
 				st.overflow = 'visible';
 				st.position = 'relative';
@@ -1881,51 +2176,77 @@ export class SheetView extends TextFileView {
 				st.clipPath = spill.visualRight
 					? `inset(0 -${spill.extra}px 0 0)`
 					: `inset(0 0 0 -${spill.extra}px)`;
-				// Hide the vertical grid lines the text crosses (like Google Sheets). The erasers sit
-				// behind the text (z-index -1 inside this cell) but above the cell borders.
-				const eraserColor =
-					f?.bgColor ??
-					'var(--ht-cell-background-color, var(--background-primary))';
-				for (const offset of spill.lines) {
-					const eraser = td.createDiv({
-						cls: 'rtl-sheet-spill-eraser',
-					});
-					eraser.style.background = eraserColor;
-					if (spill.visualRight)
-						eraser.style.left = `${offset - 2}px`;
-					else eraser.style.right = `${offset - 2}px`;
-				}
 			}
 		}
 	};
 
 	/**
+	 * Every spill of a row. A cell has to know whether text from another cell crosses its grid
+	 * line, so the whole row is worked out at once and kept until the sheet changes.
+	 */
+	private rowSpill(hot: Handsontable.Core, row: number): RowSpill {
+		const cached = this.spillCache.get(row);
+		if (cached) return cached;
+		const result: RowSpill = { spills: new Map(), crossed: new Set() };
+		this.spillCache.set(row, result);
+		const cols = hot.countCols();
+		for (let col = 0; col < cols; col++) {
+			const raw: unknown = hot.getSourceDataAtCell(row, col);
+			if (raw === null || raw === undefined || raw === '') continue;
+			if (this.model.images[key(row, col)]) continue;
+			const f = this.model.cellFormats[key(row, col)];
+			if ((f?.wrap ?? 'overflow') !== 'overflow' || f?.rotate) continue;
+			const mg = this.mergeAt(hot, row, col);
+			// Cells hidden inside a merge show nothing; merges over several rows do not spill.
+			if (mg && (mg.row !== row || mg.col !== col || mg.rowspan > 1))
+				continue;
+			const display = this.resolveRaw(raw, 0, false, { row, col });
+			if (display === null || typeof display !== 'string') continue;
+			if (NUMERIC_RE.test(display)) continue;
+			const crossed: number[] = [];
+			const spill = this.spillInfo(
+				hot,
+				row,
+				col,
+				display,
+				f,
+				mg?.colspan ?? 1,
+				crossed,
+			);
+			if (!spill) continue;
+			result.spills.set(col, spill);
+			for (const c of crossed) result.crossed.add(c);
+		}
+		return result;
+	}
+
+	/**
 	 * Text that is wider than its cell spills into the empty cells next to it (like Excel).
 	 * Numbers and numeric formula results never spill: only text, and only as far as needed.
+	 * `crossed` receives the columns whose inline-end grid line the text crosses.
 	 */
 	private spillInfo(
 		hot: Handsontable.Core,
 		row: number,
 		col: number,
 		text: string,
-		isNumber: boolean,
 		f: CellFormat | undefined,
-	): { visualRight: boolean; extra: number; lines: number[] } | null {
-		if (!text || isNumber) return null;
+		colspan: number,
+		crossed: number[],
+	): SpillInfo | null {
+		if (!text) return null;
 
 		// A merged cell is as wide as all the columns it covers.
-		const colspan = this.mergeAt(hot, row, col)?.colspan ?? 1;
 		let own = 0;
 		for (let c = col; c < col + colspan; c++) own += hot.getColWidth(c);
 		const needed =
-			this.measureTextWidth(text, f) * this.zoom + 2 * CELL_PADDING;
+			this.measureTextWidth(text, f) * this.zoom + 2 * CELL_PADDING + 2;
 		if (needed <= own) return null; // it fits: nothing crosses the cell border
 
 		const visualRight = !/[\u0590-\u08FF]/.test(text);
 		// In an RTL sheet, column index + 1 is the visually-left neighbour.
 		const delta = visualRight === !this.model.rtl ? 1 : -1;
 
-		const lines: number[] = [own]; // the cell's own border is crossed
 		let reach = own;
 		let extra = 0;
 		for (
@@ -1936,16 +2257,19 @@ export class SheetView extends TextFileView {
 			const raw: unknown = hot.getSourceDataAtCell(row, c);
 			if (
 				!(raw === null || raw === undefined || raw === '') ||
-				this.model.images[key(row, c)]
+				this.model.images[key(row, c)] ||
+				this.mergeAt(hot, row, c)
 			)
 				break;
+			// The line between two columns is the inline-end border of the one with the lower
+			// index: this cell's own (or the last neighbour's) going up, the neighbour's going down.
+			crossed.push(delta > 0 ? (c === col + colspan ? col : c - 1) : c);
 			const w = hot.getColWidth(c);
 			extra += w;
 			reach += w;
 			if (needed <= reach) break;
-			lines.push(reach);
 		}
-		return extra > 0 ? { visualRight, extra, lines } : null;
+		return extra > 0 ? { visualRight, extra } : null;
 	}
 
 	private renderRotated(
@@ -2735,6 +3059,23 @@ export class SheetView extends TextFileView {
 		);
 
 		g = group();
+		const chartBtn: HTMLButtonElement = this.addButton(
+			g,
+			'chart-column',
+			'Chart',
+			'Insert a chart: column, bar, line, pie or scatter',
+			() =>
+				this.showMenu(
+					chartBtn,
+					CHART_TYPES.map((t) => ({
+						title: t.label,
+						icon: CHART_ICONS[t.value],
+						onClick: () => this.insertChart(t.value),
+					})),
+				),
+		);
+
+		g = group();
 		const importBtn: HTMLButtonElement = this.addButton(
 			g,
 			'file-input',
@@ -3076,7 +3417,11 @@ export class SheetView extends TextFileView {
 		const inside = (rg: SelRange): boolean =>
 			row >= rg.r1 && row <= rg.r2 && col >= rg.c1 && col <= rg.c2;
 		const picked = this.refPick?.range;
-		return (!!picked && inside(picked)) || this.formulaRefs.some(inside);
+		return (
+			(!!picked && inside(picked)) ||
+			this.formulaRefs.some(inside) ||
+			this.chartPickRanges.some(inside)
+		);
 	}
 
 	/** Reads the references of the selected cell's formula; true when they changed. */
@@ -3102,7 +3447,11 @@ export class SheetView extends TextFileView {
 	 * renderer outlines the rest as they scroll into view.
 	 */
 	private refreshFormulaRefs(): void {
-		if (!this.readFormulaRefs()) return;
+		if (this.readFormulaRefs()) this.paintOutlines();
+	}
+
+	/** Updates the dashed outlines of the cells on screen (see isOutlined). */
+	private paintOutlines(): void {
 		const hot = this.hot;
 		if (!hot || hot.isDestroyed) return;
 		this.gridEl
@@ -3120,6 +3469,12 @@ export class SheetView extends TextFileView {
 
 	private onSelectionChanged(): void {
 		this.clearRefPick();
+		// While the chart editor is open, selected cells go into its active range field.
+		if (this.chartEditor) {
+			const ranges = this.getSelectedRanges();
+			const last = ranges[ranges.length - 1];
+			if (last) this.chartEditor.pickRange(last);
+		}
 		const first = this.getSelectedRanges()[0];
 		this.formulaCell = first ? { row: first.r1, col: first.c1 } : null;
 		this.refreshFormulaRefs();
@@ -3216,6 +3571,7 @@ export class SheetView extends TextFileView {
 			images: { ...m.images },
 			imageSizes: { ...m.imageSizes },
 			widenRecords: JSON.stringify(m.widenRecords ?? {}),
+			charts: JSON.stringify(m.charts),
 			colWidths: m.colWidths.slice(),
 			rowHeights: m.rowHeights.slice(),
 		};
@@ -3365,6 +3721,9 @@ export class SheetView extends TextFileView {
 		m.widenRecords = JSON.parse(state.widenRecords) as NonNullable<
 			SheetModel['widenRecords']
 		>;
+		m.charts = JSON.parse(state.charts) as ChartSpec[];
+		// The editor shows the chart as the undo left it (or closes when it is gone).
+		window.setTimeout(() => this.chartEditor?.refresh());
 		// Every size is applied again: Handsontable moved its own sizes while undoing.
 		const cols = hot.countCols();
 		m.colWidths = state.colWidths.slice(0, cols);
@@ -3401,6 +3760,18 @@ export class SheetView extends TextFileView {
 
 		if (e.code === 'KeyF' && !e.shiftKey) {
 			e.preventDefault();
+			this.openFind();
+			return;
+		}
+		// Ctrl+G instead of the graph view (the view's scope may have handled it already).
+		if (
+			e.code === 'KeyG' &&
+			!e.shiftKey &&
+			this.plugin.settings.ctrlGFind &&
+			!e.defaultPrevented
+		) {
+			e.preventDefault();
+			e.stopImmediatePropagation();
 			this.openFind();
 			return;
 		}
@@ -3733,7 +4104,7 @@ export class SheetView extends TextFileView {
 		});
 	}
 
-	private openFind(): void {
+	openFind(): void {
 		const input = this.ui.findInput;
 		if (!input) return;
 		const wasShown = this.findBarEl.isShown();
@@ -4073,6 +4444,622 @@ export class SheetView extends TextFileView {
 		plugin.done(() => step);
 	}
 
+	/* ---------------- Keyboard ---------------- */
+
+	/** Registers Ctrl+G (Cmd+G) in the view's scope while the setting is on. */
+	private applyShortcutSettings(): void {
+		const scope = this.scope;
+		if (!scope) return;
+		if (this.findHotkey) {
+			scope.unregister(this.findHotkey);
+			this.findHotkey = null;
+		}
+		if (this.plugin.settings.ctrlGFind)
+			this.findHotkey = scope.register(['Mod'], 'g', () => {
+				this.openFind();
+				return false; // handled: Obsidian does not open the graph view
+			});
+	}
+
+	/* ---------------- Sheets (tabs) ---------------- */
+
+	/** The tab bar under the grid: one tab per sheet, and a button that adds a sheet. */
+	private renderTabs(): void {
+		const bar = this.tabBarEl;
+		bar.empty();
+		bar.setAttr('dir', this.model.rtl ? 'rtl' : 'ltr');
+		const add = bar.createEl('button', {
+			cls: 'rtl-sheet-btn rtl-sheet-tab-add',
+			attr: { 'aria-label': 'Add sheet', title: 'Add sheet' },
+		});
+		setIcon(add, 'plus');
+		add.addEventListener('click', () => this.addSheet());
+
+		const list = bar.createDiv({
+			cls: 'rtl-sheet-tab-list',
+			attr: { role: 'tablist' },
+		});
+		this.sheets.forEach((sheet, i) => {
+			const active = i === this.activeSheet;
+			const tab = list.createDiv({
+				cls: `rtl-sheet-tab${active ? ' is-active' : ''}`,
+				attr: {
+					role: 'tab',
+					'aria-selected': String(active),
+					title: sheet.name,
+				},
+			});
+			tab.createSpan({ cls: 'rtl-sheet-tab-name', text: sheet.name });
+			tab.addEventListener('click', () => this.showSheet(i));
+			tab.addEventListener('dblclick', () => this.renameSheet(i));
+			tab.addEventListener('contextmenu', (e) => {
+				e.preventDefault();
+				this.showSheetMenu(i, tab);
+			});
+			if (active) {
+				// Touch screens have no reliable right-click: the active tab has a menu button.
+				const more = tab.createSpan({
+					cls: 'rtl-sheet-tab-menu',
+					attr: { 'aria-label': 'Sheet options' },
+				});
+				setIcon(more, 'chevron-down');
+				more.addEventListener('click', (e) => {
+					e.stopPropagation();
+					this.showSheetMenu(i, tab);
+				});
+				window.requestAnimationFrame(() =>
+					tab.scrollIntoView({ block: 'nearest', inline: 'nearest' }),
+				);
+			}
+		});
+	}
+
+	private showSheetMenu(index: number, anchor: HTMLElement): void {
+		const entries: MenuEntry[] = [
+			{
+				title: 'Rename…',
+				icon: 'pencil',
+				onClick: () => this.renameSheet(index),
+			},
+			{
+				title: 'Duplicate',
+				icon: 'copy',
+				onClick: () => this.duplicateSheet(index),
+			},
+		];
+		if (index > 0)
+			entries.push({
+				title: 'Move toward the start',
+				icon: this.model.rtl ? 'arrow-right' : 'arrow-left',
+				onClick: () => this.moveSheet(index, -1),
+			});
+		if (index < this.sheets.length - 1)
+			entries.push({
+				title: 'Move toward the end',
+				icon: this.model.rtl ? 'arrow-left' : 'arrow-right',
+				onClick: () => this.moveSheet(index, 1),
+			});
+		if (this.sheets.length > 1)
+			entries.push({
+				title: 'Delete',
+				icon: 'trash-2',
+				onClick: () => this.deleteSheet(index),
+			});
+		this.showMenu(anchor, entries);
+	}
+
+	/** Closes the cell editor and the formula bar, keeping what was typed. */
+	private finishEditing(): void {
+		const input = this.ui.formulaInput;
+		if (input && input.ownerDocument.activeElement === input) input.blur();
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const editor = hot.getActiveEditor() as unknown as
+			| { isOpened?: () => boolean; finishEditing?: () => void }
+			| undefined;
+		if (editor?.isOpened?.()) editor.finishEditing?.();
+	}
+
+	/**
+	 * Shows another sheet. The grid is built again for it, so the undo history and the
+	 * filters start over (they belong to the sheet that was shown).
+	 */
+	private showSheet(index: number, force = false): void {
+		const next = this.sheets[index];
+		if (!next || (index === this.activeSheet && !force)) return;
+		this.finishEditing();
+		this.captureGridStateIfLive();
+		this.destroyGrid();
+		this.filters.clear();
+		this.formulaRefs = [];
+		this.activeSheet = index;
+		this.model = next;
+		this.rebuildGrid();
+	}
+
+	private sheetNameError(name: string, except: number): string | null {
+		const clean = cleanSheetName(name);
+		if (!clean) return 'Enter a name.';
+		const taken = this.sheets.some(
+			(s, i) =>
+				i !== except && s.name.toLowerCase() === clean.toLowerCase(),
+		);
+		return taken ? 'Another sheet already has this name.' : null;
+	}
+
+	private addSheet(): void {
+		this.finishEditing();
+		this.captureGridStateIfLive();
+		const name = uniqueSheetName(
+			this.sheets.map((s) => s.name),
+			`Sheet${this.sheets.length + 1}`,
+		);
+		const index = this.activeSheet + 1;
+		this.sheets.splice(
+			index,
+			0,
+			createDefaultModel(this.plugin.settings, this.model.rtl, name),
+		);
+		this.showSheet(index, true);
+		this.markDirty();
+	}
+
+	private duplicateSheet(index: number): void {
+		const source = this.sheets[index];
+		if (!source) return;
+		this.finishEditing();
+		this.captureGridStateIfLive();
+		const copy = JSON.parse(JSON.stringify(source)) as SheetModel;
+		copy.name = uniqueSheetName(
+			this.sheets.map((s) => s.name),
+			cleanSheetName(`${source.name} copy`),
+		);
+		copy.charts = copy.charts.map((c) => ({ ...c, id: newChartId() }));
+		this.sheets.splice(index + 1, 0, copy);
+		this.showSheet(index + 1, true);
+		this.markDirty();
+	}
+
+	private moveSheet(index: number, delta: number): void {
+		const target = index + delta;
+		const sheet = this.sheets[index];
+		const other = this.sheets[target];
+		if (!sheet || !other) return;
+		this.sheets[index] = other;
+		this.sheets[target] = sheet;
+		this.activeSheet = this.sheets.indexOf(this.model);
+		this.renderTabs();
+		this.markDirty();
+	}
+
+	private deleteSheet(index: number): void {
+		const sheet = this.sheets[index];
+		if (!sheet || this.sheets.length < 2) return;
+		new ConfirmModal(
+			this.app,
+			'Delete sheet',
+			`Delete "${sheet.name}" and everything on it? This cannot be undone.`,
+			'Delete',
+			() => {
+				const at = this.sheets.indexOf(sheet);
+				if (at < 0 || this.sheets.length < 2) return;
+				if (at === this.activeSheet) {
+					this.finishEditing();
+					this.destroyGrid();
+					this.sheets.splice(at, 1);
+					const next = Math.min(at, this.sheets.length - 1);
+					this.activeSheet = -1; // so showSheet does not skip it
+					this.showSheet(next, true);
+				} else {
+					this.sheets.splice(at, 1);
+					this.activeSheet = this.sheets.indexOf(this.model);
+					this.renderTabs();
+				}
+				this.invalidateRowSizes(); // formulas that used the sheet now show #REF!
+				this.hot?.render();
+				this.markDirty();
+			},
+		).open();
+	}
+
+	private renameSheet(index: number): void {
+		const sheet = this.sheets[index];
+		if (!sheet) return;
+		new TextPromptModal(
+			this.app,
+			'Rename sheet',
+			sheet.name,
+			(value) => this.sheetNameError(value, index),
+			(value) => {
+				const name = cleanSheetName(value);
+				const old = sheet.name;
+				if (name === old) return;
+				sheet.name = name;
+				this.renameSheetReferences(old, name);
+				this.renderTabs();
+				this.markDirty();
+			},
+		).open();
+	}
+
+	/** Formulas that name the renamed sheet ("Old!A1", "'Old name'!A1") follow the new name. */
+	private renameSheetReferences(oldName: string, newName: string): void {
+		const escaped = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+		const pattern = new RegExp(
+			`(^|[^A-Za-z0-9_.'])(?:'${escaped}'|${escaped})!`,
+			'gi',
+		);
+		const replacement = `$1${sheetRefName(newName)}!`;
+		const rewrite = (v: Scalar): Scalar =>
+			typeof v === 'string' && v.startsWith('=')
+				? v.replace(pattern, replacement)
+				: v;
+
+		this.captureGridStateIfLive();
+		const changes: [number, number, Scalar][] = [];
+		this.sheets.forEach((sheet, i) => {
+			sheet.data.forEach((row, r) =>
+				row.forEach((v, c) => {
+					const next = rewrite(v);
+					if (next === v) return;
+					// The shown sheet changes through the grid, so the change can be undone.
+					if (i === this.activeSheet && this.hot) changes.push([r, c, next]);
+					else row[c] = next;
+				}),
+			);
+		});
+		const hot = this.hot;
+		if (changes.length > 0 && hot && !hot.isDestroyed)
+			hot.setDataAtCell(changes, 'rename');
+		this.invalidateRowSizes();
+		hot?.render();
+	}
+
+	/* ---------------- Charts ---------------- */
+
+	/** Draws the charts again once the current work is done (they read the cells). */
+	private queueCharts(): void {
+		if (this.chartFrame) return;
+		this.chartFrame = window.requestAnimationFrame(() => {
+			this.chartFrame = 0;
+			try {
+				this.renderCharts();
+			} catch (e) {
+				console.error('[Free-Excel] Could not draw the charts', e);
+			}
+		});
+	}
+
+	/** Where cell A1 starts inside the scrolled part of the grid (after the headers), in px. */
+	private chartOrigin(hot: Handsontable.Core): { x: number; y: number } {
+		const view = (
+			hot as unknown as {
+				view?: {
+					getRowHeaderWidth?: () => number;
+					getColumnHeaderHeight?: () => number;
+				};
+			}
+		).view;
+		return {
+			x: view?.getRowHeaderWidth?.() ?? 0,
+			y: view?.getColumnHeaderHeight?.() ?? 0,
+		};
+	}
+
+	private renderCharts(): void {
+		const hot = this.hot;
+		const layer = this.chartLayer;
+		if (!hot || hot.isDestroyed || !layer || !layer.isConnected) return;
+		layer.empty();
+		if (this.model.charts.length === 0) return;
+		const origin = this.chartOrigin(hot);
+		const read = (row: number, col: number): Scalar =>
+			this.resolveRaw(this.rawCell(this.activeSheet, row, col), 0, true, {
+				row,
+				col,
+			});
+		for (const chart of this.model.charts) {
+			const box = layer.createDiv({ cls: 'rtl-sheet-chart' });
+			box.toggleClass('is-editing', chart.id === this.chartEditorId);
+			this.placeChart(box, chart, origin);
+			// Presses on a chart must not select cells or start editing them.
+			for (const type of [
+				'mousedown',
+				'pointerdown',
+				'touchstart',
+				'dblclick',
+				'contextmenu',
+			])
+				box.addEventListener(type, (e) => e.stopPropagation(), {
+					passive: true,
+				});
+
+			const head = box.createDiv({ cls: 'rtl-sheet-chart-head' });
+			head.style.height = `${CHART_HEAD_H * this.zoom}px`;
+			head.style.fontSize = `${Math.round(13 * this.zoom * 10) / 10}px`;
+			const title = head.createSpan({
+				cls: 'rtl-sheet-chart-title',
+				text: chart.title || 'Chart',
+				attr: { dir: 'auto' },
+			});
+			if (chart.titleColor) title.style.color = chart.titleColor;
+			const editBtn = head.createEl('button', {
+				cls: 'rtl-sheet-chart-btn',
+				attr: { 'aria-label': 'Edit chart', title: 'Edit chart' },
+			});
+			setIcon(editBtn, 'pencil');
+			editBtn.addEventListener('click', () => this.editChart(chart.id));
+			const deleteBtn = head.createEl('button', {
+				cls: 'rtl-sheet-chart-btn',
+				attr: { 'aria-label': 'Delete chart', title: 'Delete chart' },
+			});
+			setIcon(deleteBtn, 'trash-2');
+			deleteBtn.addEventListener('click', () => this.deleteChart(chart.id));
+			head.addEventListener('pointerdown', (e) =>
+				this.onChartDrag(e, box, chart.id, 'move'),
+			);
+
+			const body = box.createDiv({ cls: 'rtl-sheet-chart-body' });
+			body.addEventListener('dblclick', () => this.editChart(chart.id));
+			renderChart(
+				body,
+				chart,
+				readChartData(chart, read),
+				chart.w,
+				chart.h - CHART_HEAD_H,
+			);
+			const grip = box.createDiv({
+				cls: 'rtl-sheet-chart-grip',
+				attr: { 'aria-label': 'Resize chart' },
+			});
+			grip.addEventListener('pointerdown', (e) =>
+				this.onChartDrag(e, box, chart.id, 'resize'),
+			);
+		}
+	}
+
+	private placeChart(
+		box: HTMLElement,
+		chart: Pick<ChartSpec, 'x' | 'y' | 'w' | 'h'>,
+		origin: { x: number; y: number },
+	): void {
+		const z = this.zoom;
+		const st = box.style;
+		st.top = `${origin.y + chart.y * z}px`;
+		// The first column is on the right in a right-to-left sheet.
+		st.left = this.model.rtl ? '' : `${origin.x + chart.x * z}px`;
+		st.right = this.model.rtl ? `${origin.x + chart.x * z}px` : '';
+		st.width = `${chart.w * z}px`;
+		st.height = `${chart.h * z}px`;
+	}
+
+	/** Dragging the title bar moves a chart, dragging its corner resizes it. One undo step each. */
+	private onChartDrag(
+		e: PointerEvent,
+		box: HTMLElement,
+		id: string,
+		mode: 'move' | 'resize',
+	): void {
+		if (e.pointerType === 'mouse' && e.button !== 0) return;
+		if (e.target instanceof HTMLElement && e.target.closest('button')) return;
+		const hot = this.hot;
+		const chart = this.model.charts.find((c) => c.id === id);
+		if (!hot || !chart) return;
+		e.preventDefault();
+		const handle = e.currentTarget as HTMLElement;
+		handle.setPointerCapture(e.pointerId);
+		const origin = this.chartOrigin(hot);
+		// In a right-to-left sheet X grows to the left.
+		const dir = this.model.rtl ? -1 : 1;
+		const start = { x: e.clientX, y: e.clientY };
+		const next = { x: chart.x, y: chart.y, w: chart.w, h: chart.h };
+		let moved = false;
+		box.addClass('is-dragging');
+
+		const onMove = (ev: PointerEvent): void => {
+			if (ev.pointerId !== e.pointerId) return;
+			const dx = ((ev.clientX - start.x) * dir) / this.zoom;
+			const dy = (ev.clientY - start.y) / this.zoom;
+			if (mode === 'move') {
+				next.x = Math.max(0, Math.round(chart.x + dx));
+				next.y = Math.max(0, Math.round(chart.y + dy));
+			} else {
+				next.w = Math.max(CHART_MIN_W, Math.round(chart.w + dx));
+				next.h = Math.max(CHART_MIN_H, Math.round(chart.h + dy));
+			}
+			moved = true;
+			this.placeChart(box, next, origin);
+		};
+		const onEnd = (ev: PointerEvent): void => {
+			if (ev.pointerId !== e.pointerId) return;
+			handle.removeEventListener('pointermove', onMove);
+			handle.removeEventListener('pointerup', onEnd);
+			handle.removeEventListener('pointercancel', onEnd);
+			box.removeClass('is-dragging');
+			if (!moved) return;
+			this.replaceChart(id, (c) => ({ ...c, ...next }));
+		};
+		handle.addEventListener('pointermove', onMove);
+		handle.addEventListener('pointerup', onEnd);
+		handle.addEventListener('pointercancel', onEnd);
+	}
+
+	/** Charts are replaced, never changed in place (undo compares them). */
+	private replaceChart(
+		id: string,
+		change: (chart: ChartSpec) => ChartSpec | null,
+	): void {
+		const charts: ChartSpec[] = [];
+		for (const c of this.model.charts) {
+			if (c.id !== id) {
+				charts.push(c);
+				continue;
+			}
+			const next = change(c);
+			if (next) charts.push(next);
+		}
+		this.model.charts = charts;
+		this.markDirty();
+		this.queueCharts();
+	}
+
+	private editChart(id: string): void {
+		if (this.chartEditorId === id) return;
+		this.openChartEditor(id, false);
+	}
+
+	/** Reads what cells show on the shown sheet (formulas worked out), for charts. */
+	private chartReader(): (row: number, col: number) => Scalar {
+		return (row, col) =>
+			this.resolveRaw(this.rawCell(this.activeSheet, row, col), 0, true, {
+				row,
+				col,
+			});
+	}
+
+	/**
+	 * Opens the chart editor next to the grid. It changes the chart live (every change is an
+	 * undo step), and the sheet stays usable for picking ranges.
+	 */
+	private openChartEditor(id: string, isNew: boolean): void {
+		this.closeChartEditor();
+		this.chartEditorId = id;
+		this.chartPanelEl.show();
+		const get = (): ChartSpec | null =>
+			this.model.charts.find((c) => c.id === id) ?? null;
+		this.chartEditor = new ChartEditor(
+			{
+				el: this.chartPanelEl,
+				get,
+				update: (change, tag) => {
+					const current = get();
+					if (!current) return;
+					const next = JSON.parse(JSON.stringify(current)) as ChartSpec;
+					change(next);
+					// Typing a title or dragging a color picker is one undo step.
+					this.coalesce = { tag: `chart:${id}:${tag}`, windowMs: 2000 };
+					this.replaceChart(id, () => next);
+				},
+				close: () => this.closeChartEditor(),
+				highlight: (ranges) => {
+					this.chartPickRanges = ranges;
+					this.paintOutlines();
+				},
+				seriesNames: (spec) => {
+					const data = readChartData(spec, this.chartReader());
+					return spec.type === 'pie'
+						? data.categories
+						: data.series.map((s) => s.name);
+				},
+			},
+			isNew,
+		);
+		this.onResize();
+		this.queueCharts(); // marks the chart that is being edited
+	}
+
+	private closeChartEditor(): void {
+		const editor = this.chartEditor;
+		if (!editor) return;
+		this.chartEditor = null;
+		this.chartEditorId = null;
+		this.queueCharts();
+		editor.destroy();
+		this.chartPanelEl.hide();
+		this.chartPickRanges = [];
+		this.paintOutlines();
+		this.onResize();
+		this.hot?.listen();
+	}
+
+	private deleteChart(id: string): void {
+		if (this.chartEditorId === id) this.closeChartEditor();
+		this.replaceChart(id, () => null);
+		new Notice('Chart deleted. Undo (Ctrl+Z) brings it back.');
+	}
+
+	/**
+	 * The block of filled cells around a cell (like Ctrl+A in Excel), so a chart can be made
+	 * from one selected cell of a table.
+	 */
+	private dataRegion(hot: Handsontable.Core, row: number, col: number): SelRange {
+		const filled = (r: number, c: number): boolean => {
+			const v: unknown = hot.getSourceDataAtCell(r, c);
+			return v !== null && v !== undefined && v !== '';
+		};
+		const rg: SelRange = { r1: row, r2: row, c1: col, c2: col };
+		const rows = hot.countRows();
+		const cols = hot.countCols();
+		const anyIn = (r1: number, r2: number, c1: number, c2: number): boolean => {
+			for (let r = r1; r <= r2; r++)
+				for (let c = c1; c <= c2; c++) if (filled(r, c)) return true;
+			return false;
+		};
+		for (let grew = true, guard = 0; grew && guard < 10000; guard++) {
+			grew = false;
+			if (rg.r1 > 0 && anyIn(rg.r1 - 1, rg.r1 - 1, rg.c1, rg.c2)) {
+				rg.r1--;
+				grew = true;
+			}
+			if (rg.r2 < rows - 1 && anyIn(rg.r2 + 1, rg.r2 + 1, rg.c1, rg.c2)) {
+				rg.r2++;
+				grew = true;
+			}
+			if (rg.c1 > 0 && anyIn(rg.r1, rg.r2, rg.c1 - 1, rg.c1 - 1)) {
+				rg.c1--;
+				grew = true;
+			}
+			if (rg.c2 < cols - 1 && anyIn(rg.r1, rg.r2, rg.c2 + 1, rg.c2 + 1)) {
+				rg.c2++;
+				grew = true;
+			}
+		}
+		return rg;
+	}
+
+	private insertChart(type: ChartSpec['type']): void {
+		const hot = this.hot;
+		const selected = this.getSelectedRanges()[0];
+		if (!hot || hot.isDestroyed || !selected) {
+			new Notice('Select the cells to show in the chart first.');
+			return;
+		}
+		const single = selected.r1 === selected.r2 && selected.c1 === selected.c2;
+		const area = single
+			? this.dataRegion(hot, selected.r1, selected.c1)
+			: { ...selected };
+		// Scatter charts: the first column holds the X values, the others the Y values.
+		const split = type === 'scatter' && area.c2 > area.c1;
+		const range = split ? { ...area, c1: area.c1 + 1 } : area;
+		const xRange = split ? { ...area, c2: area.c1 } : undefined;
+		const read = this.chartReader();
+		// Next to the data: right of its last column, level with its first row.
+		let x = 0;
+		for (let c = 0; c <= area.c2; c++)
+			x += this.model.colWidths[c] || DEFAULT_COL_WIDTH;
+		let y = 0;
+		for (let r = 0; r < area.r1; r++)
+			y += this.model.rowHeights[r] || this.computeRowHeight(r);
+		const spec: ChartSpec = {
+			id: newChartId(),
+			type,
+			title: '',
+			range,
+			xRange,
+			headerRow: guessHeaderRow(area, read),
+			trendline: false,
+			x: x + 16,
+			y,
+			w: CHART_DEFAULT_W,
+			h: CHART_DEFAULT_H,
+		};
+		// The chart appears right away; the editor changes it from there.
+		this.model.charts = [...this.model.charts, spec];
+		this.markDirty();
+		this.queueCharts();
+		this.openChartEditor(spec.id, true);
+	}
+
 	/* ---------------- Zoom ---------------- */
 
 	/** Zoom scales widths, heights and fonts together; model values stay at 100%. */
@@ -4098,10 +5085,11 @@ export class SheetView extends TextFileView {
 			this.model.rowHeights.forEach((h, i) => {
 				if (h) rows.setManualSize(i, Math.round(h * z));
 			});
-			hot.render();
-			hot.refreshDimensions();
-		}
+				hot.render();
+				hot.refreshDimensions();
+			}
 		this.ui.zoomLabel?.setText(`${Math.round(z * 100)}%`);
+		this.queueCharts();
 	}
 
 	/* ---------------- Manual sizes ---------------- */
@@ -4697,14 +5685,25 @@ export class SheetView extends TextFileView {
 
 	/* ---------------- Export ---------------- */
 
-	private toExcelValue(raw: unknown, row: number, col: number): ExcelJS.CellValue {
+	private toExcelValue(
+		raw: unknown,
+		row: number,
+		col: number,
+		sheet: number,
+	): ExcelJS.CellValue {
 		if (typeof raw === 'string') {
 			if (
 				this.plugin.settings.enableFormulas &&
 				raw.length > 1 &&
 				raw.startsWith('=')
 			) {
-				const result = this.resolveRaw(raw, 0, false, { row, col });
+				const result = this.resolveRaw(
+					raw,
+					0,
+					false,
+					{ row, col },
+					sheet,
+				);
 				return {
 					formula: normalizeSeparators(raw.slice(1)),
 					result: (result ??
@@ -4726,14 +5725,56 @@ export class SheetView extends TextFileView {
 		}
 		try {
 			this.captureGridState();
-			const m = this.model;
-			const defaultSizePx = this.plugin.settings.defaultFontSize;
-
 			const wb = new ExcelJS.Workbook();
-			const ws = wb.addWorksheet(sanitizeSheetName(file.basename), {
-				views: [{ rightToLeft: m.rtl }],
-			});
+			let skippedImages = 0;
+			let skippedCharts = 0;
+			for (let i = 0; i < this.sheets.length; i++) {
+				const m = this.sheets[i];
+				if (!m) continue;
+				skippedImages += await this.exportSheet(wb, m, i);
+				skippedCharts += m.charts.length;
+			}
 
+			const buffer = await wb.xlsx.writeBuffer();
+			const bytes = new Uint8Array(buffer);
+			const data = bytes.buffer;
+
+			const path = normalizePath(
+				file.path.replace(/\.[^./\\]+$/, '') + '.xlsx',
+			);
+			const existing = this.app.vault.getAbstractFileByPath(path);
+			if (existing instanceof TFile)
+				await this.app.vault.modifyBinary(existing, data);
+			else await this.app.vault.createBinary(path, data);
+
+			const notes: string[] = [];
+			if (skippedImages > 0)
+				notes.push(
+					`${skippedImages} image(s) skipped: only png, jpg and gif are supported in .xlsx`,
+				);
+			if (skippedCharts > 0)
+				notes.push(`${skippedCharts} chart(s) are not exported`);
+			new Notice(
+				notes.length > 0
+					? `Exported to ${path} (${notes.join('; ')})`
+					: `Exported to ${path}`,
+			);
+		} catch (e) {
+			this.plugin.reportError('Excel export failed', e);
+		}
+	}
+
+	/** Adds one sheet to the workbook; returns how many images could not be exported. */
+	private async exportSheet(
+		wb: ExcelJS.Workbook,
+		m: SheetModel,
+		sheetIndex: number,
+	): Promise<number> {
+		const defaultSizePx = this.plugin.settings.defaultFontSize;
+		const ws = wb.addWorksheet(sanitizeSheetName(m.name), {
+			views: [{ rightToLeft: m.rtl }],
+		});
+		{
 			m.data.forEach((rowArr, r) => {
 				rowArr.forEach((raw, c) => {
 					const f = m.cellFormats[key(r, c)];
@@ -4744,7 +5785,7 @@ export class SheetView extends TextFileView {
 					const cell = ws.getCell(r + 1, c + 1);
 					let isNumber = false;
 					if (hasValue) {
-						const value = this.toExcelValue(raw, r, c);
+						const value = this.toExcelValue(raw, r, c, sheetIndex);
 						cell.value = value;
 						isNumber =
 							typeof value === 'number' ||
@@ -4853,26 +5894,7 @@ export class SheetView extends TextFileView {
 					editAs: 'oneCell',
 				} as unknown as Parameters<ExcelJS.Worksheet['addImage']>[1]);
 			}
-
-			const buffer = await wb.xlsx.writeBuffer();
-			const bytes = new Uint8Array(buffer);
-			const data = bytes.buffer;
-
-			const path = normalizePath(
-				file.path.replace(/\.[^./\\]+$/, '') + '.xlsx',
-			);
-			const existing = this.app.vault.getAbstractFileByPath(path);
-			if (existing instanceof TFile)
-				await this.app.vault.modifyBinary(existing, data);
-			else await this.app.vault.createBinary(path, data);
-
-			new Notice(
-				skippedImages > 0
-					? `Exported to ${path} (${skippedImages} image(s) skipped: only png, jpg and gif are supported in .xlsx)`
-					: `Exported to ${path}`,
-			);
-		} catch (e) {
-			this.plugin.reportError('Excel export failed', e);
+			return skippedImages;
 		}
 	}
 }

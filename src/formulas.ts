@@ -20,7 +20,13 @@ import type { Scalar } from './model';
 
 type Val = Scalar | Scalar[];
 type Token = { t: 'num' | 'str' | 'id' | 'op'; v: string };
-export type GetCell = (row: number, col: number) => Scalar;
+/** `sheet` is the name of another sheet (as written in the formula), or undefined for the formula's own sheet. */
+export type GetCell = (row: number, col: number, sheet?: string) => Scalar;
+
+/** Sheet name given to the parser for the formula's own sheet, so "Sheet1!A1" still means another sheet. */
+const OWN_SHEET = '#own-sheet#';
+const otherSheet = (sheet: unknown): string | undefined =>
+	typeof sheet === 'string' && sheet !== OWN_SHEET ? sheet : undefined;
 
 const ERR_RE =
 	/^#(?:DIV\/0!|N\/A|NAME\?|VALUE!|REF!|NUM!|NULL!|CYCLE!|ERROR!)$/;
@@ -573,17 +579,19 @@ function evaluateWithLibrary(
 	const parser = new FormulaParser({
 		functions: EXTRA_FUNCTIONS,
 		functionsNeedContext: CONTEXT_FUNCTIONS,
-		onCell: (ref: { row: number; col: number }) =>
-			toLibValue(getCell(ref.row - 1, ref.col - 1)),
+		onCell: (ref: { sheet?: string; row: number; col: number }) =>
+			toLibValue(getCell(ref.row - 1, ref.col - 1, otherSheet(ref.sheet))),
 		onRange: (ref: {
+			sheet?: string;
 			from: { row: number; col: number };
 			to: { row: number; col: number };
 		}) => {
+			const sheet = otherSheet(ref.sheet);
 			const rows: unknown[][] = [];
 			for (let r = ref.from.row; r <= ref.to.row; r++) {
 				const row: unknown[] = [];
 				for (let c = ref.from.col; c <= ref.to.col; c++)
-					row.push(toLibValue(getCell(r - 1, c - 1)));
+					row.push(toLibValue(getCell(r - 1, c - 1, sheet)));
 				rows.push(row);
 			}
 			return rows;
@@ -593,7 +601,7 @@ function evaluateWithLibrary(
 	const parsed: unknown = parser.parse(
 		normalizeSeparators(formula.replace(/^\s*=/, '')),
 		{
-			sheet: 'Sheet1',
+			sheet: OWN_SHEET,
 			row: (at?.row ?? 0) + 1,
 			col: (at?.col ?? 0) + 1,
 		},
