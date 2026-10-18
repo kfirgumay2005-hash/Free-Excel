@@ -11,8 +11,19 @@ import {
 	TextFileView,
 	WorkspaceLeaf,
 	normalizePath,
+	requestUrl,
 	setIcon,
 } from 'obsidian';
+import {
+	AI_ERROR_TEXT,
+	AiAssistantPanel,
+	AiFormulaRunner,
+	AiTool,
+	AiToolResult,
+	JsonSchema,
+	aiApiKey,
+	generateGeminiImage,
+} from './ai';
 import Handsontable from 'handsontable';
 import 'handsontable/styles/handsontable.min.css';
 import 'handsontable/styles/ht-theme-main.min.css';
@@ -20,6 +31,7 @@ import './plugin.css';
 import ExcelJS from 'exceljs';
 import {
 	DEFAULT_SETTINGS,
+	MAX_RECENT_EMOJIS,
 	MAX_SAVED_COLORS,
 	PluginSettings,
 	SettingsTab,
@@ -27,8 +39,12 @@ import {
 } from './settings';
 import {
 	CellBorders,
+	CellComment,
 	CellFormat,
 	ChartSpec,
+	ChartType,
+	DEFAULT_COMMENT_COLOR,
+	FloatingImage,
 	ColumnFilter,
 	DEFAULT_COL_WIDTH,
 	FONT_SIZES,
@@ -53,6 +69,8 @@ import {
 	indexToColumnLabel,
 	isEmptyFormat,
 	key,
+	parseRangeRef,
+	rangeLabel,
 	rowBaseHeight,
 	serializeWorkbook,
 	sheetRefName,
@@ -71,6 +89,7 @@ import {
 	renderChart,
 } from './charts';
 import {
+	FORMULA_FUNCTIONS,
 	FormulaFunctionInfo,
 	buildFunctionCall,
 	evaluateFormula,
@@ -78,17 +97,21 @@ import {
 	moveFormula,
 	normalizeSeparators,
 	referenceSlot,
+	setAiFormulaHandler,
 	shiftFormulaRows,
 } from './formulas';
 import { ImportedSheet, parseCsv, parseXlsx } from './xlsx';
 import {
 	ColumnFilterModal,
+	CommentModal,
 	ConfirmModal,
+	EmojiPicker,
 	FormulaAutocomplete,
 	FunctionPickerModal,
 	ImportChoice,
 	ImportDirectionModal,
 	ImportPrompt,
+	LinkModal,
 	TextPromptModal,
 	VaultFilePickerModal,
 } from './ui';
@@ -102,6 +125,11 @@ const SHEET_EXT = 'sheet';
 /** Used automatically when another plugin already owns the .sheet extension. */
 const FALLBACK_SHEET_EXT = 'rtlsheet';
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'];
+/** Most image paths the find_images tool returns. */
+const AI_MAX_FOUND_IMAGES = 30;
+/** Results of one web image search, and the width of the copies it links to (in px). */
+const AI_MAX_WEB_IMAGES = 12;
+const AI_WEB_IMAGE_WIDTH = 800;
 const MAX_IMAGE_CELL_PX = 240;
 /** Limits (unzoomed px) for a cell that is resized by dragging a corner of its image. */
 const MIN_IMAGE_RESIZE_PX = 24;
@@ -227,6 +255,16 @@ function compareForSort(a: Scalar, b: Scalar, descending: boolean): number {
 				: Number(a) - Number(b);
 	}
 	return descending ? -order : order;
+}
+
+/** The image type ExcelJS can embed for a vault file, or null (webp and svg cannot go in .xlsx). */
+function excelImageType(file: unknown): 'png' | 'jpeg' | 'gif' | null {
+	if (!(file instanceof TFile)) return null;
+	const ext = file.extension.toLowerCase();
+	if (ext === 'png') return 'png';
+	if (ext === 'jpg' || ext === 'jpeg') return 'jpeg';
+	if (ext === 'gif') return 'gif';
+	return null;
 }
 
 function decodeText(data: ArrayBuffer): string {
@@ -425,9 +463,237 @@ const CHART_ICONS: Record<ChartSpec['type'], string> = {
 	scatter: 'chart-scatter',
 };
 
-function newChartId(): string {
-	return `chart-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+function newChartId(prefix = 'chart'): string {
+	return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
+
+/** Smallest floating image (unzoomed px). */
+const FLOAT_MIN_PX = 16;
+/** Widest a floating image is when it is inserted (unzoomed px). */
+const FLOAT_DEFAULT_MAX_PX = 320;
+
+/** True for a web address (or another URL scheme) rather than a note name. */
+function isExternalLink(target: string): boolean {
+	return /^[a-z][a-z0-9+.-]*:/i.test(target);
+}
+
+/** A cell value as a check box reads it: TRUE, "TRUE", 1 and "1" are checked. */
+function isChecked(value: unknown): boolean {
+	if (typeof value === 'boolean') return value;
+	if (typeof value === 'number') return value !== 0;
+	if (typeof value === 'string')
+		return /^(true|1)$/i.test(value.trim());
+	return false;
+}
+
+/* ---------------- AI assistant tools ---------------- */
+
+/** How much of the sheet goes with every question to the assistant. */
+const AI_CONTEXT_ROWS = 100;
+const AI_CONTEXT_COLS = 30;
+const AI_CONTEXT_CELL_CHARS = 120;
+/** Most cells one read_range call returns. */
+const AI_MAX_READ_CELLS = 3000;
+
+const RANGE_PARAM: JsonSchema = {
+	type: 'string',
+	description: 'Cells in A1 notation, such as "B2:D10" or "C5".',
+};
+const CELL_PARAM: JsonSchema = {
+	type: 'string',
+	description: 'One cell in A1 notation, such as "C5".',
+};
+
+/** What the assistant can do with the shown sheet (see SheetView.runAiTool). */
+const AI_TOOLS: AiTool[] = [
+	{
+		name: 'read_range',
+		description:
+			'Reads cells. Returns the rows of the range; a formula cell is shown as "=FORMULA → result".',
+		parameters: {
+			type: 'object',
+			properties: {
+				range: RANGE_PARAM,
+				sheet: {
+					type: 'string',
+					description: 'Name of another sheet of the file; the shown sheet when missing.',
+				},
+			},
+			required: ['range'],
+		},
+	},
+	{
+		name: 'write_cells',
+		description:
+			'Writes values or formulas into the shown sheet, starting at a cell. Each inner list is one row, left to right. "" empties a cell; formulas start with "=". The grid grows when needed.',
+		parameters: {
+			type: 'object',
+			properties: {
+				start: { type: 'string', description: 'Top-left cell, such as "A1".' },
+				rows: {
+					type: 'array',
+					description: 'Rows of cell contents.',
+					items: { type: 'array', items: { type: 'string' } },
+				},
+			},
+			required: ['start', 'rows'],
+		},
+	},
+	{
+		name: 'clear_range',
+		description: 'Empties the cells of a range of the shown sheet (formats stay).',
+		parameters: {
+			type: 'object',
+			properties: { range: RANGE_PARAM },
+			required: ['range'],
+		},
+	},
+	{
+		name: 'format_range',
+		description:
+			'Formats cells of the shown sheet. Only the given properties change; "" removes a color or an alignment.',
+		parameters: {
+			type: 'object',
+			properties: {
+				range: RANGE_PARAM,
+				bold: { type: 'boolean' },
+				italic: { type: 'boolean' },
+				underline: { type: 'boolean' },
+				strikethrough: { type: 'boolean' },
+				font_size: { type: 'number', description: 'In px; 0 = the default size.' },
+				text_color: { type: 'string', description: '"#rrggbb"' },
+				fill_color: { type: 'string', description: 'Background, "#rrggbb"' },
+				align: {
+					type: 'string',
+					description: 'left, center or right; "" for the default.',
+				},
+				vertical_align: {
+					type: 'string',
+					description: 'top, middle or bottom; "" for the default.',
+				},
+				wrap: {
+					type: 'string',
+					enum: ['overflow', 'wrap', 'expand'],
+					description: 'Long text: spill into empty neighbours, wrap inside the cell, or widen the column.',
+				},
+				borders: { type: 'string', enum: ['all', 'outer', 'none'] },
+				checkbox: {
+					type: 'boolean',
+					description: 'Show check boxes; their values are TRUE (checked) and FALSE.',
+				},
+			},
+			required: ['range'],
+		},
+	},
+	{
+		name: 'set_comment',
+		description: 'Adds, changes or (with empty text) removes the comment of a cell.',
+		parameters: {
+			type: 'object',
+			properties: {
+				cell: CELL_PARAM,
+				text: { type: 'string' },
+				color: { type: 'string', description: 'Corner mark color, "#rrggbb" (optional).' },
+			},
+			required: ['cell', 'text'],
+		},
+	},
+	{
+		name: 'set_link',
+		description:
+			'Makes a cell a link to a web address or to a note in the vault; an empty url removes the link.',
+		parameters: {
+			type: 'object',
+			properties: {
+				cell: CELL_PARAM,
+				url: { type: 'string', description: 'https://… or the name of a note.' },
+				text: { type: 'string', description: 'What the cell shows (optional).' },
+			},
+			required: ['cell', 'url'],
+		},
+	},
+	{
+		name: 'insert_chart',
+		description:
+			'Inserts a chart of a range of the shown sheet (with its header row and label column).',
+		parameters: {
+			type: 'object',
+			properties: {
+				type: { type: 'string', enum: ['column', 'bar', 'line', 'pie', 'scatter'] },
+				range: RANGE_PARAM,
+				title: { type: 'string' },
+			},
+			required: ['type', 'range'],
+		},
+	},
+	{
+		name: 'find_images',
+		description:
+			'Looks for image files in the vault whose path contains the given words (in any order). Returns vault paths for insert_image; an empty query lists the newest images.',
+		parameters: {
+			type: 'object',
+			properties: {
+				query: { type: 'string', description: 'Words of the file name or folder, such as "money".' },
+			},
+			required: ['query'],
+		},
+	},
+	{
+		name: 'search_web_images',
+		description:
+			'Searches Wikimedia Commons (free pictures) and returns image addresses for insert_image, with their titles and sizes. Search words in English work best.',
+		parameters: {
+			type: 'object',
+			properties: {
+				query: { type: 'string', description: 'What the picture shows, such as "banknotes".' },
+			},
+			required: ['query'],
+		},
+	},
+	{
+		name: 'insert_image',
+		description:
+			'Puts an image from the vault (a path from find_images) or from a web address (https://…, downloaded into the vault) in a cell, or over the sheet as a floating image.',
+		parameters: {
+			type: 'object',
+			properties: {
+				source: { type: 'string', description: 'Vault path of an image, or an https:// address of an image file.' },
+				cell: {
+					type: 'string',
+					description: 'The cell, such as "C5"; the selected cell when missing. A floating image is placed at its top-left corner.',
+				},
+				floating: { type: 'boolean', description: 'true: float over the sheet; false or missing: inside the cell.' },
+			},
+			required: ['source'],
+		},
+	},
+	{
+		name: 'generate_image',
+		description:
+			'Makes a new picture from a description with the Gemini image model (needs the Gemini API key), saves it in the vault and puts it in a cell or over the sheet. Use only when the user wants a new picture made.',
+		parameters: {
+			type: 'object',
+			properties: {
+				prompt: { type: 'string', description: 'What the picture shows, in detail (in English works best).' },
+				cell: {
+					type: 'string',
+					description: 'The cell, such as "C5"; the selected cell when missing.',
+				},
+				floating: { type: 'boolean', description: 'true: float over the sheet; false or missing: inside the cell.' },
+			},
+			required: ['prompt'],
+		},
+	},
+	{
+		name: 'select_range',
+		description: 'Selects and scrolls to cells, to show them to the user.',
+		parameters: {
+			type: 'object',
+			properties: { range: RANGE_PARAM },
+			required: ['range'],
+		},
+	},
+];
 
 /** The color pickers in the toolbar; fill and text also have saved colors. */
 type ColorKind = 'fill' | 'text' | 'border';
@@ -491,10 +757,13 @@ interface SideState {
 	formats: Record<string, CellFormat>;
 	images: Record<string, string>;
 	imageSizes: Record<string, ImageSizeRecord>;
+	comments: Record<string, CellComment>;
+	links: Record<string, string>;
 	/** As JSON: these records are changed in place. */
 	widenRecords: string;
 	/** As JSON: a chart is moved by changing its position. */
 	charts: string;
+	floatingImages: string;
 	colWidths: (number | null)[];
 	rowHeights: (number | null)[];
 }
@@ -523,8 +792,11 @@ function sameSideState(a: SideState, b: SideState): boolean {
 		sameRecord(a.formats, b.formats) &&
 		sameRecord(a.images, b.images) &&
 		sameRecord(a.imageSizes, b.imageSizes) &&
+		sameRecord(a.comments, b.comments) &&
+		sameRecord(a.links, b.links) &&
 		a.widenRecords === b.widenRecords &&
 		a.charts === b.charts &&
+		a.floatingImages === b.floatingImages &&
 		sameSizes(a.colWidths, b.colWidths) &&
 		sameSizes(a.rowHeights, b.rowHeights)
 	);
@@ -537,6 +809,8 @@ interface RowsSnapshot {
 	formats: Record<string, CellFormat>;
 	images: Record<string, string>;
 	imageSizes: Record<string, ImageSizeRecord>;
+	comments: Record<string, CellComment>;
+	links: Record<string, string>;
 	heights: (number | null)[];
 }
 
@@ -657,12 +931,54 @@ export class SheetView extends TextFileView {
 	private fontFamilyCache: string | null = null;
 	private measureCtx: CanvasRenderingContext2D | null = null;
 
+	/** Answers of AI formulas, saved with the file (see WorkbookModel.aiResults). */
+	private aiResults: Record<string, string> = {};
+	private readonly aiRunner: AiFormulaRunner;
+	/** Next to the grid: the list of comments or the AI assistant. */
+	private sidePanelEl: HTMLElement;
+	private commentsPanelEl: HTMLElement;
+	private aiPanelEl: HTMLElement;
+	private sidePanel: 'comments' | 'ai' | null = null;
+	/** Kept while the view is open, so closing the panel does not lose the conversation. */
+	private aiPanel: AiAssistantPanel | null = null;
+	private readonly emojiPicker = new EmojiPicker();
+	/** Popup next to a cell that shows its comment and link. */
+	private cellInfoEl: HTMLElement;
+	/** The cell the popup shows. */
+	private cellInfoCell: { row: number; col: number } | null = null;
+	/** The cell under the mouse pointer. */
+	private hoverCell: { row: number; col: number } | null = null;
+	/** True while the pointer is over the popup (so its links can be clicked). */
+	private cellInfoHovered = false;
+	private cellInfoTimer = 0;
+	/** The floating image that was clicked last; Delete removes it. */
+	private activeFloatId: string | null = null;
+	/** A press on a check box: where it started, to tell a tap from a scroll. */
+	private checkboxPress: {
+		row: number;
+		col: number;
+		x: number;
+		y: number;
+		pointerId: number;
+	} | null = null;
+
 	constructor(leaf: WorkspaceLeaf, plugin: RtlSpreadsheetPlugin) {
 		super(leaf);
 		this.plugin = plugin;
 		this.model = createDefaultModel(plugin.settings, defaultSheetRtl());
 		this.sheets = [this.model];
 		this.appliedSettings = { ...plugin.settings };
+		this.aiRunner = new AiFormulaRunner(
+			this.app,
+			() => this.plugin.settings,
+			() => this.aiResults,
+			(stored) => {
+				// Cells show the answer now; a new answer is saved with the file.
+				this.invalidateRowSizes();
+				if (this.hot && !this.hot.isDestroyed) this.hot.render();
+				if (stored) this.markDirty();
+			},
+		);
 		// Hotkeys registered here win over Obsidian's while this view has the focus.
 		this.scope = new Scope(this.app.scope);
 		this.applyShortcutSettings();
@@ -691,6 +1007,27 @@ export class SheetView extends TextFileView {
 		const body = this.contentEl.createDiv({ cls: 'rtl-sheet-body' });
 		this.gridEl = body.createDiv({ cls: 'rtl-sheet-grid' });
 		body.appendChild(this.chartPanelEl);
+		this.sidePanelEl = body.createDiv({ cls: 'rtl-sheet-side-panel' });
+		this.sidePanelEl.hide();
+		this.commentsPanelEl = this.sidePanelEl.createDiv({
+			cls: 'rtl-sheet-comments-panel',
+		});
+		this.aiPanelEl = this.sidePanelEl.createDiv({ cls: 'rtl-sheet-ai-host' });
+		this.sidePanelEl.addEventListener('focusin', (e) => {
+			if (e.target instanceof HTMLElement && isTextEntry(e.target))
+				this.hot?.unlisten();
+		});
+		this.cellInfoEl = this.contentEl.createDiv({ cls: 'rtl-sheet-cell-info' });
+		this.cellInfoEl.hide();
+		for (const type of ['mousedown', 'pointerdown', 'touchstart'])
+			this.cellInfoEl.addEventListener(type, (e) => e.stopPropagation());
+		this.cellInfoEl.addEventListener('mouseenter', () => {
+			this.cellInfoHovered = true;
+		});
+		this.cellInfoEl.addEventListener('mouseleave', () => {
+			this.cellInfoHovered = false;
+			this.queueCellInfo();
+		});
 		this.tabBarEl = this.contentEl.createDiv({ cls: 'rtl-sheet-tabs' });
 
 		this.buildFormulaBar();
@@ -748,9 +1085,56 @@ export class SheetView extends TextFileView {
 		this.registerDomEvent(
 			this.gridEl,
 			'scroll',
-			() => this.queueSelectionHandles(),
+			() => {
+				this.queueSelectionHandles();
+				this.positionCellInfo();
+			},
 			{ capture: true, passive: true },
 		);
+		// Check boxes: a tap toggles them (a drag that scrolls the sheet does not).
+		this.registerDomEvent(
+			this.gridEl,
+			'pointerdown',
+			(e) => this.onCheckboxPress(e),
+			{ capture: true },
+		);
+		this.registerDomEvent(this.gridEl, 'pointerup', (e) =>
+			this.onCheckboxRelease(e),
+		);
+		this.registerDomEvent(
+			this.gridEl,
+			'click',
+			(e) => this.onGridClick(e),
+			{ capture: true },
+		);
+		this.registerDomEvent(
+			this.gridEl,
+			'dblclick',
+			(e) => {
+				// A double click on a check box toggles it twice; it does not open the editor.
+				if (
+					e.target instanceof HTMLElement &&
+					e.target.closest('.rtl-sheet-checkbox')
+				)
+					e.stopPropagation();
+			},
+			{ capture: true },
+		);
+		// Comments and links show up next to the cell under the pointer (when the setting is on).
+		this.registerDomEvent(this.gridEl, 'mouseover', (e) => {
+			if (!this.plugin.settings.commentsOnHover) return;
+			const cell = this.cellFromEvent(e);
+			const same =
+				cell?.row === this.hoverCell?.row &&
+				cell?.col === this.hoverCell?.col;
+			if (same) return;
+			this.hoverCell = cell;
+			this.queueCellInfo(cell && this.hasCellInfo(cell) ? 0 : 150);
+		});
+		this.registerDomEvent(this.gridEl, 'mouseleave', () => {
+			this.hoverCell = null;
+			this.queueCellInfo(250);
+		});
 		for (const type of ['mousedown', 'touchstart', 'touchend'] as const)
 			this.registerDomEvent(
 				this.gridEl,
@@ -877,6 +1261,7 @@ export class SheetView extends TextFileView {
 		return serializeWorkbook({
 			sheets: this.sheets,
 			active: this.activeSheet,
+			aiResults: this.aiResults,
 		});
 	}
 
@@ -895,6 +1280,7 @@ export class SheetView extends TextFileView {
 				}
 			}
 			const next = this.normalizeWorkbook(parsed);
+			this.aiResults = next.aiResults ?? {};
 			this.diskData = data;
 			if (clear) this.filters.clear(); // another file: its columns mean something else
 			// Same file with the same tabs: stay on the sheet that is shown.
@@ -933,6 +1319,7 @@ export class SheetView extends TextFileView {
 		);
 		this.sheets = [this.model];
 		this.activeSheet = 0;
+		this.aiResults = {};
 		this.dirty = false;
 	}
 
@@ -958,7 +1345,11 @@ export class SheetView extends TextFileView {
 		}
 		window.clearInterval(this.refreshTimer);
 		window.cancelAnimationFrame(this.chartFrame);
+		window.clearTimeout(this.cellInfoTimer);
 		this.autocomplete.destroy();
+		this.emojiPicker.close();
+		this.aiPanel?.destroy();
+		this.aiPanel = null;
 		this.destroyGrid();
 	}
 
@@ -1058,6 +1449,10 @@ export class SheetView extends TextFileView {
 
 		if (!prev.autosave && s.autosave && this.dirty) this.requestSave();
 		if (prev.ctrlGFind !== s.ctrlGFind) this.applyShortcutSettings();
+		if (!s.commentsOnHover && this.hoverCell) {
+			this.hoverCell = null;
+			this.refreshCellInfo();
+		}
 		this.applyToolbarScale();
 		this.applySelectionHandleSettings();
 		this.renderPalette('fill');
@@ -1093,8 +1488,14 @@ export class SheetView extends TextFileView {
 			sheets.push(sheet);
 		}
 		const active = Math.round(Number(r.active));
+		const ai = (raw as { aiResults?: unknown } | null)?.aiResults;
+		const aiResults: Record<string, string> = {};
+		if (ai && typeof ai === 'object')
+			for (const [k, v] of Object.entries(ai as Record<string, unknown>))
+				if (typeof v === 'string') aiResults[k] = v;
 		return {
 			sheets,
+			aiResults,
 			active:
 				Number.isFinite(active) && active >= 0 && active < sheets.length
 					? active
@@ -1188,12 +1589,60 @@ export class SheetView extends TextFileView {
 				r.widenRecords && typeof r.widenRecords === 'object'
 					? r.widenRecords
 					: {},
+			comments: this.normalizeComments(r.comments),
+			links: this.normalizeLinks(r.links),
 			merges: Array.isArray(r.merges) ? r.merges : [],
 			colWidths: Array.isArray(r.colWidths) ? r.colWidths : [],
 			rowHeights: Array.isArray(r.rowHeights) ? r.rowHeights : [],
 			rtl: typeof r.rtl === 'boolean' ? r.rtl : defaultSheetRtl(),
 			charts: this.normalizeCharts(r.charts),
+			floatingImages: this.normalizeFloatingImages(r.floatingImages),
 		};
+	}
+
+	private normalizeComments(raw: unknown): Record<string, CellComment> {
+		const out: Record<string, CellComment> = {};
+		if (!raw || typeof raw !== 'object') return out;
+		for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+			const c = v as Partial<CellComment> | null;
+			if (!c || typeof c.text !== 'string' || !/^\d+,\d+$/.test(k)) continue;
+			out[k] = {
+				text: c.text,
+				color:
+					typeof c.color === 'string' && /^#[0-9a-f]{6}$/i.test(c.color)
+						? c.color
+						: DEFAULT_COMMENT_COLOR,
+				time: typeof c.time === 'number' ? c.time : 0,
+			};
+		}
+		return out;
+	}
+
+	private normalizeLinks(raw: unknown): Record<string, string> {
+		const out: Record<string, string> = {};
+		if (!raw || typeof raw !== 'object') return out;
+		for (const [k, v] of Object.entries(raw as Record<string, unknown>))
+			if (typeof v === 'string' && v && /^\d+,\d+$/.test(k)) out[k] = v;
+		return out;
+	}
+
+	private normalizeFloatingImages(raw: unknown): FloatingImage[] {
+		if (!Array.isArray(raw)) return [];
+		const num = (v: unknown, fallback: number): number =>
+			typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+		const out: FloatingImage[] = [];
+		for (const item of raw as (Partial<FloatingImage> | null)[]) {
+			if (!item || typeof item.path !== 'string' || !item.path) continue;
+			out.push({
+				id: typeof item.id === 'string' ? item.id : newChartId('img'),
+				path: item.path,
+				x: Math.max(0, num(item.x, 0)),
+				y: Math.max(0, num(item.y, 0)),
+				w: Math.max(FLOAT_MIN_PX, num(item.w, 200)),
+				h: Math.max(FLOAT_MIN_PX, num(item.h, 150)),
+			});
+		}
+		return out;
 	}
 
 	/**
@@ -1328,6 +1777,8 @@ export class SheetView extends TextFileView {
 		this.model.cellFormats = remap(this.model.cellFormats);
 		this.model.images = remap(this.model.images);
 		this.model.imageSizes = remap(this.model.imageSizes);
+		this.model.comments = remap(this.model.comments);
+		this.model.links = remap(this.model.links);
 		// Charts keep showing the same cells (replaced, not changed: undo compares them).
 		const shiftRange = (rg: SelRange): SelRange => {
 			const lo = axis === 'row' ? rg.r1 : rg.c1;
@@ -1421,24 +1872,33 @@ export class SheetView extends TextFileView {
 					if (hit && hit.raw === raw) return hit.value;
 				}
 				const limitHits = this.formulaLimitHits;
-				const value = evaluateFormula(
-					raw,
-					(r, c, sheetName) => {
-						const target =
-							sheetName === undefined
-								? sheet
-								: this.sheetIndexByName(sheetName);
-						if (target < 0) return '#REF!';
-						return this.resolveRaw(
-							this.rawCell(target, r, c),
-							depth + 1,
-							true,
-							{ row: r, col: c },
-							target,
-						);
-					},
-					at,
+				// CLAUDE() and GEMINI() ask through this view; the cell is remembered for "ask again".
+				const previous = setAiFormulaHandler((provider, prompt, context) =>
+					this.aiRunner.resolve(provider, prompt, context, cacheKey),
 				);
+				let value: Scalar;
+				try {
+					value = evaluateFormula(
+						raw,
+						(r, c, sheetName) => {
+							const target =
+								sheetName === undefined
+									? sheet
+									: this.sheetIndexByName(sheetName);
+							if (target < 0) return '#REF!';
+							return this.resolveRaw(
+								this.rawCell(target, r, c),
+								depth + 1,
+								true,
+								{ row: r, col: c },
+								target,
+							);
+						},
+						at,
+					);
+				} finally {
+					setAiFormulaHandler(previous);
+				}
 				// A result that ran into the depth limit depends on where the evaluation started.
 				if (cacheKey && this.formulaLimitHits === limitHits)
 					this.formulaCache.set(cacheKey, { raw, value });
@@ -1691,6 +2151,11 @@ export class SheetView extends TextFileView {
 			this.plugin.reportError('Could not create the spreadsheet grid', e);
 		}
 		this.renderTabs();
+		// Another sheet (or the same one again): its comments and floating images.
+		this.hoverCell = null;
+		this.activeFloatId = null;
+		this.refreshCellInfo();
+		this.refreshSidePanel();
 	}
 
 	private copyFormatsOnFill(
@@ -2105,6 +2570,7 @@ export class SheetView extends TextFileView {
 			'htDimmed',
 			'rtl-sheet-img-cell',
 			'rtl-sheet-img-active',
+			'rtl-sheet-checkbox-cell',
 		);
 		td.classList.toggle('rtl-sheet-ref-pick', this.isOutlined(row, col));
 		const found = this.findMatches[this.findIndex];
@@ -2119,6 +2585,8 @@ export class SheetView extends TextFileView {
 
 		const f = this.model.cellFormats[key(row, col)];
 		const imagePath = this.model.images[key(row, col)];
+		const comment = this.model.comments[key(row, col)];
+		const link = this.model.links[key(row, col)];
 		const rtl = this.model.rtl;
 		const wrap = f?.wrap ?? 'overflow';
 		const st = td.style;
@@ -2156,6 +2624,10 @@ export class SheetView extends TextFileView {
 			? 'transparent'
 			: '';
 		applyBorderStyles(st, f?.borders);
+		// The colored corner of a cell with a comment.
+		td.classList.toggle('rtl-sheet-has-comment', !!comment);
+		if (comment) st.setProperty('--rtl-sheet-comment-color', comment.color);
+		else st.removeProperty('--rtl-sheet-comment-color');
 
 		if (imagePath) {
 			this.renderImage(td, imagePath);
@@ -2164,6 +2636,9 @@ export class SheetView extends TextFileView {
 				'rtl-sheet-img-active',
 				!!active && active.row === row && active.col === col,
 			);
+		} else if (f?.checkbox) {
+			this.renderCheckbox(td, display);
+			st.textAlign = f.align ?? 'center';
 		} else if (f?.rotate) {
 			this.renderRotated(td, text, f.rotate);
 		} else if (wrap === 'overflow') {
@@ -2178,7 +2653,25 @@ export class SheetView extends TextFileView {
 					: `inset(0 0 0 -${spill.extra}px)`;
 			}
 		}
+		if (link && !imagePath && !f?.checkbox && !f?.rotate && text) {
+			td.textContent = '';
+			td.createSpan({ cls: 'rtl-sheet-link', text });
+		}
 	};
+
+	private renderCheckbox(td: HTMLTableCellElement, value: Scalar): void {
+		td.textContent = '';
+		td.addClass('rtl-sheet-checkbox-cell');
+		const box = td.createEl('input', {
+			type: 'checkbox',
+			cls: 'rtl-sheet-checkbox',
+			attr: { tabindex: '-1', 'aria-label': 'Check box' },
+		});
+		box.checked = isChecked(value);
+		box.setCssProps({
+			'--rtl-sheet-checkbox-size': `${Math.round(16 * this.zoom)}px`,
+		});
+	}
 
 	/**
 	 * Every spill of a row. A cell has to know whether text from another cell crosses its grid
@@ -2195,7 +2688,8 @@ export class SheetView extends TextFileView {
 			if (raw === null || raw === undefined || raw === '') continue;
 			if (this.model.images[key(row, col)]) continue;
 			const f = this.model.cellFormats[key(row, col)];
-			if ((f?.wrap ?? 'overflow') !== 'overflow' || f?.rotate) continue;
+			if ((f?.wrap ?? 'overflow') !== 'overflow' || f?.rotate || f?.checkbox)
+				continue;
 			const mg = this.mergeAt(hot, row, col);
 			// Cells hidden inside a merge show nothing; merges over several rows do not spill.
 			if (mg && (mg.row !== row || mg.col !== col || mg.rowspan > 1))
@@ -2258,6 +2752,7 @@ export class SheetView extends TextFileView {
 			if (
 				!(raw === null || raw === undefined || raw === '') ||
 				this.model.images[key(row, c)] ||
+				this.model.cellFormats[key(row, c)]?.checkbox ||
 				this.mergeAt(hot, row, c)
 			)
 				break;
@@ -3048,6 +3543,22 @@ export class SheetView extends TextFileView {
 						icon: 'clipboard-paste',
 						onClick: () => void this.pasteImageFromClipboard(),
 					},
+					{
+						title: 'Floating image from vault…',
+						icon: 'image-plus',
+						onClick: () => this.pickFloatingImageFromVault(),
+					},
+					{
+						title: 'Floating image from device…',
+						icon: 'image-up',
+						onClick: () => void this.insertFloatingImageFrom('device'),
+					},
+					{
+						title: 'Floating image from clipboard',
+						icon: 'clipboard-paste',
+						onClick: () =>
+							void this.insertFloatingImageFrom('clipboard'),
+					},
 				]),
 		);
 		this.addButton(
@@ -3073,6 +3584,82 @@ export class SheetView extends TextFileView {
 						onClick: () => this.insertChart(t.value),
 					})),
 				),
+		);
+
+		g = group();
+		const emojiBtn: HTMLButtonElement = this.addButton(
+			g,
+			'smile',
+			'Emoji',
+			'Insert an emoji',
+			() => this.openEmojiPicker(emojiBtn),
+		);
+		this.addButton(
+			g,
+			'square-check',
+			'Checkbox',
+			'Check boxes in the selected cells (Space checks them; again to remove)',
+			() => this.toggleCheckboxes(),
+		);
+		this.addButton(
+			g,
+			'link',
+			'Link',
+			'Insert link (Ctrl+click a link to open it)',
+			() => this.editLink(),
+		);
+
+		g = group();
+		this.addButton(
+			g,
+			'message-square-plus',
+			'Add comment',
+			'Add or edit the comment of the selected cell',
+			() => this.editComment(),
+		);
+		this.addButton(
+			g,
+			'messages-square',
+			'Show comments',
+			'Show all comments in this sheet',
+			() => this.toggleSidePanel('comments'),
+		);
+
+		g = group();
+		const aiBtn: HTMLButtonElement = this.addButton(
+			g,
+			'sparkles',
+			'AI',
+			'AI assistant and AI formulas (Claude and Gemini)',
+			() =>
+				this.showMenu(aiBtn, [
+					{
+						title: 'AI assistant',
+						icon: 'sparkles',
+						onClick: () => this.toggleSidePanel('ai'),
+						checked: this.sidePanel === 'ai',
+					},
+					{
+						title: 'Insert CLAUDE() formula',
+						icon: 'square-function',
+						onClick: () => this.insertAiFormula('CLAUDE'),
+					},
+					{
+						title: 'Insert GEMINI() formula',
+						icon: 'square-function',
+						onClick: () => this.insertAiFormula('GEMINI'),
+					},
+					{
+						title: 'Ask again for the AI formulas in the selection',
+						icon: 'refresh-cw',
+						onClick: () => this.refreshAiFormulas(),
+					},
+					{
+						title: 'AI settings…',
+						icon: 'settings',
+						onClick: () => this.openPluginSettings(),
+					},
+				]),
 		);
 
 		g = group();
@@ -3479,6 +4066,8 @@ export class SheetView extends TextFileView {
 		this.formulaCell = first ? { row: first.r1, col: first.c1 } : null;
 		this.refreshFormulaRefs();
 		this.markActiveImageCell();
+		this.setActiveFloat(null);
+		this.queueCellInfo(0);
 
 		if (this.painterSource) {
 			const ranges = this.getSelectedRanges();
@@ -3570,8 +4159,11 @@ export class SheetView extends TextFileView {
 			formats: { ...m.cellFormats },
 			images: { ...m.images },
 			imageSizes: { ...m.imageSizes },
+			comments: { ...m.comments },
+			links: { ...m.links },
 			widenRecords: JSON.stringify(m.widenRecords ?? {}),
 			charts: JSON.stringify(m.charts),
+			floatingImages: JSON.stringify(m.floatingImages),
 			colWidths: m.colWidths.slice(),
 			rowHeights: m.rowHeights.slice(),
 		};
@@ -3718,6 +4310,11 @@ export class SheetView extends TextFileView {
 		m.cellFormats = { ...state.formats };
 		m.images = { ...state.images };
 		m.imageSizes = { ...state.imageSizes };
+		m.comments = { ...state.comments };
+		m.links = { ...state.links };
+		m.floatingImages = JSON.parse(state.floatingImages) as FloatingImage[];
+		this.refreshCellInfo();
+		this.refreshSidePanel();
 		m.widenRecords = JSON.parse(state.widenRecords) as NonNullable<
 			SheetModel['widenRecords']
 		>;
@@ -3905,6 +4502,8 @@ export class SheetView extends TextFileView {
 			formats: pick(this.model.cellFormats),
 			images: pick(this.model.images),
 			imageSizes: pick(this.model.imageSizes),
+			comments: pick(this.model.comments),
+			links: pick(this.model.links),
 			heights: rows.map((r) => this.model.rowHeights[r] ?? null),
 		};
 	}
@@ -3941,6 +4540,8 @@ export class SheetView extends TextFileView {
 			formats: move(snap.formats),
 			images: move(snap.images),
 			imageSizes: move(snap.imageSizes),
+			comments: move(snap.comments),
+			links: move(snap.links),
 			heights: order.map((from) => snap.heights[from] ?? null),
 		};
 	}
@@ -3961,6 +4562,8 @@ export class SheetView extends TextFileView {
 		replace(this.model.cellFormats, snap.formats);
 		replace(this.model.images, snap.images);
 		replace(this.model.imageSizes, snap.imageSizes);
+		replace(this.model.comments, snap.comments);
+		replace(this.model.links, snap.links);
 
 		const changes: [number, number, Scalar][] = [];
 		snap.rows.forEach((r, i) => {
@@ -4246,9 +4849,12 @@ export class SheetView extends TextFileView {
 	 * smaller index is the visually right-most one, so the two are swapped there.
 	 * Single-edge modes add to the existing borders; "outer" and "all" replace them.
 	 */
-	private applyBorders(mode: BorderMode): void {
+	private applyBorders(
+		mode: BorderMode,
+		ranges: SelRange[] = this.requireSelection(),
+	): void {
 		const rtl = this.model.rtl;
-		this.applyFormat(this.requireSelection(), (f, r, c, rg) => {
+		this.applyFormat(ranges, (f, r, c, rg) => {
 			const prev = f.borders ?? {};
 			const withColor = (b: CellBorders): CellBorders =>
 				prev.color ? { ...b, color: prev.color } : b;
@@ -4615,6 +5221,10 @@ export class SheetView extends TextFileView {
 			cleanSheetName(`${source.name} copy`),
 		);
 		copy.charts = copy.charts.map((c) => ({ ...c, id: newChartId() }));
+		copy.floatingImages = copy.floatingImages.map((f) => ({
+			...f,
+			id: newChartId('img'),
+		}));
 		this.sheets.splice(index + 1, 0, copy);
 		this.showSheet(index + 1, true);
 		this.markDirty();
@@ -4751,8 +5361,9 @@ export class SheetView extends TextFileView {
 		const layer = this.chartLayer;
 		if (!hot || hot.isDestroyed || !layer || !layer.isConnected) return;
 		layer.empty();
-		if (this.model.charts.length === 0) return;
 		const origin = this.chartOrigin(hot);
+		for (const img of this.model.floatingImages)
+			this.renderFloatingImage(layer, img, origin);
 		const read = (row: number, col: number): Scalar =>
 			this.resolveRaw(this.rawCell(this.activeSheet, row, col), 0, true, {
 				row,
@@ -4840,11 +5451,37 @@ export class SheetView extends TextFileView {
 		id: string,
 		mode: 'move' | 'resize',
 	): void {
+		const chart = this.model.charts.find((c) => c.id === id);
+		if (!chart) return;
+		this.dragBox(
+			e,
+			box,
+			chart,
+			mode,
+			{ w: CHART_MIN_W, h: CHART_MIN_H },
+			false,
+			(next) => this.replaceChart(id, (c) => ({ ...c, ...next })),
+		);
+	}
+
+	/**
+	 * Moves or resizes a box on the chart layer (a chart or a floating image) while the pointer
+	 * is dragged, and reports where it ended up. `keepRatio` keeps the shape while resizing
+	 * (Shift resizes freely).
+	 */
+	private dragBox(
+		e: PointerEvent,
+		box: HTMLElement,
+		chart: { x: number; y: number; w: number; h: number },
+		mode: 'move' | 'resize',
+		min: { w: number; h: number },
+		keepRatio: boolean,
+		done: (next: { x: number; y: number; w: number; h: number }) => void,
+	): void {
 		if (e.pointerType === 'mouse' && e.button !== 0) return;
 		if (e.target instanceof HTMLElement && e.target.closest('button')) return;
 		const hot = this.hot;
-		const chart = this.model.charts.find((c) => c.id === id);
-		if (!hot || !chart) return;
+		if (!hot) return;
 		e.preventDefault();
 		const handle = e.currentTarget as HTMLElement;
 		handle.setPointerCapture(e.pointerId);
@@ -4864,8 +5501,13 @@ export class SheetView extends TextFileView {
 				next.x = Math.max(0, Math.round(chart.x + dx));
 				next.y = Math.max(0, Math.round(chart.y + dy));
 			} else {
-				next.w = Math.max(CHART_MIN_W, Math.round(chart.w + dx));
-				next.h = Math.max(CHART_MIN_H, Math.round(chart.h + dy));
+				next.w = Math.max(min.w, Math.round(chart.w + dx));
+				next.h = Math.max(min.h, Math.round(chart.h + dy));
+				if (keepRatio && !ev.shiftKey && chart.h > 0) {
+					const ratio = chart.w / chart.h;
+					next.h = Math.max(min.h, Math.round(next.w / ratio));
+					next.w = Math.round(next.h * ratio);
+				}
 			}
 			moved = true;
 			this.placeChart(box, next, origin);
@@ -4877,7 +5519,7 @@ export class SheetView extends TextFileView {
 			handle.removeEventListener('pointercancel', onEnd);
 			box.removeClass('is-dragging');
 			if (!moved) return;
-			this.replaceChart(id, (c) => ({ ...c, ...next }));
+			done(next);
 		};
 		handle.addEventListener('pointermove', onMove);
 		handle.addEventListener('pointerup', onEnd);
@@ -5271,6 +5913,15 @@ export class SheetView extends TextFileView {
 			new Notice('Select a cell first.');
 			return;
 		}
+		const path = await this.saveImageBlob(blob, name);
+		if (path) await this.setCellImage(path, cell);
+	}
+
+	/** Saves image data as an attachment of this sheet; returns its vault path (null on failure). */
+	private async saveImageBlob(
+		blob: Blob,
+		name: string | null,
+	): Promise<string | null> {
 		try {
 			const subtype = (blob.type.split('/')[1] ?? 'png')
 				.replace('jpeg', 'jpg')
@@ -5286,9 +5937,10 @@ export class SheetView extends TextFileView {
 					this.file?.path ?? '',
 				);
 			await this.app.vault.createBinary(path, await blob.arrayBuffer());
-			await this.setCellImage(path, cell);
+			return path;
 		} catch (e) {
 			this.plugin.reportError('Could not add the image', e);
+			return null;
 		}
 	}
 
@@ -5374,19 +6026,8 @@ export class SheetView extends TextFileView {
 		col: number,
 		path: string,
 	): Promise<void> {
-		const file = this.app.vault.getAbstractFileByPath(path);
-		if (!(file instanceof TFile)) return;
-		const url = this.app.vault.getResourcePath(file);
-		const dims = await new Promise<{ w: number; h: number } | null>(
-			(resolve) => {
-				const img = new Image();
-				img.onload = () =>
-					resolve({ w: img.naturalWidth, h: img.naturalHeight });
-				img.onerror = () => resolve(null);
-				img.src = url;
-			},
-		);
-		if (!dims || dims.w <= 0 || dims.h <= 0) return;
+		const dims = await this.loadImageSize(path);
+		if (!dims) return;
 		if (this.model.images[key(row, col)] !== path) return; // image was removed while loading
 		const scale = Math.min(
 			1,
@@ -5411,6 +6052,24 @@ export class SheetView extends TextFileView {
 		};
 		this.setColumnWidth(col, w);
 		this.setRowHeight(row, h);
+	}
+
+	/** The natural size of an image in the vault, or null when it cannot be loaded. */
+	private loadImageSize(path: string): Promise<{ w: number; h: number } | null> {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return Promise.resolve(null);
+		const url = this.app.vault.getResourcePath(file);
+		return new Promise((resolve) => {
+			const img = new Image();
+			img.onload = () =>
+				resolve(
+					img.naturalWidth > 0 && img.naturalHeight > 0
+						? { w: img.naturalWidth, h: img.naturalHeight }
+						: null,
+				);
+			img.onerror = () => resolve(null);
+			img.src = url;
+		});
 	}
 
 	private clearColumnWidth(col: number): void {
@@ -5516,13 +6175,29 @@ export class SheetView extends TextFileView {
 
 	/** Delete / Backspace on a selected cell also removes its image. */
 	private onBeforeKeyDown(e: KeyboardEvent): void {
-		if (e.key !== 'Delete' && e.key !== 'Backspace') return;
 		const hot = this.hot;
 		if (!hot || hot.isDestroyed) return;
 		const editor = hot.getActiveEditor() as unknown as
 			| { isOpened?: () => boolean }
 			| undefined;
 		if (editor?.isOpened?.()) return; // the user is editing text, not clearing cells
+		if (e.key === ' ' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+			// Space checks or unchecks the selected check boxes (like Google Sheets).
+			const cells = this.selectedCheckboxCells();
+			if (cells.length > 0) {
+				e.preventDefault();
+				e.stopImmediatePropagation();
+				this.toggleCheckboxCells(cells);
+			}
+			return;
+		}
+		if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+		if (this.activeFloatId) {
+			e.preventDefault();
+			e.stopImmediatePropagation();
+			this.deleteFloatingImage(this.activeFloatId);
+			return;
+		}
 		try {
 			if (this.removeImagesInRanges(this.getSelectedRanges()) > 0) {
 				this.invalidateRowSizes();
@@ -5532,6 +6207,1181 @@ export class SheetView extends TextFileView {
 		} catch (err) {
 			this.plugin.reportError('Could not remove the image', err);
 		}
+	}
+
+	/* ---------------- Floating images ---------------- */
+
+	private pickFloatingImageFromVault(): void {
+		new VaultFilePickerModal(
+			this.app,
+			IMAGE_EXTENSIONS,
+			'Choose an image to float over the sheet…',
+			(file) => {
+				void this.addFloatingImage(file.path);
+			},
+		).open();
+	}
+
+	private async insertFloatingImageFrom(
+		source: 'device' | 'clipboard',
+	): Promise<void> {
+		try {
+			let blob: Blob | null = null;
+			let name: string | null = null;
+			if (source === 'device') {
+				const file = await this.pickLocalFile('image/*');
+				blob = file;
+				name = file?.name ?? null;
+			} else {
+				for (const item of await navigator.clipboard.read()) {
+					const type = item.types.find((t) => t.startsWith('image/'));
+					if (type) {
+						blob = await item.getType(type);
+						break;
+					}
+				}
+				if (!blob) {
+					new Notice('The clipboard does not contain an image.');
+					return;
+				}
+			}
+			if (!blob) return;
+			const path = await this.saveImageBlob(blob, name);
+			if (path) await this.addFloatingImage(path);
+		} catch (e) {
+			this.plugin.reportError('Could not add the floating image', e);
+		}
+	}
+
+	/** Puts an image over the sheet at a cell (the selected one or A1 when missing), at a comfortable size. */
+	private async addFloatingImage(
+		path: string,
+		at?: { row: number; col: number },
+	): Promise<void> {
+		const dims = await this.loadImageSize(path);
+		const scale = dims ? Math.min(1, FLOAT_DEFAULT_MAX_PX / dims.w) : 1;
+		const w = Math.max(FLOAT_MIN_PX, Math.round((dims?.w ?? 200) * scale));
+		const h = Math.max(FLOAT_MIN_PX, Math.round((dims?.h ?? 150) * scale));
+		const cell = at ?? this.formulaCell ?? { row: 0, col: 0 };
+		let x = 0;
+		for (let c = 0; c < cell.col; c++)
+			x += this.model.colWidths[c] || DEFAULT_COL_WIDTH;
+		let y = 0;
+		for (let r = 0; r < cell.row; r++)
+			y += this.model.rowHeights[r] || this.computeRowHeight(r);
+		const img: FloatingImage = { id: newChartId('img'), path, x, y, w, h };
+		this.model.floatingImages = [...this.model.floatingImages, img];
+		this.activeFloatId = img.id;
+		this.markDirty();
+		this.queueCharts();
+	}
+
+	private renderFloatingImage(
+		layer: HTMLElement,
+		img: FloatingImage,
+		origin: { x: number; y: number },
+	): void {
+		const box = layer.createDiv({ cls: 'rtl-sheet-float-img' });
+		box.toggleClass('is-active', img.id === this.activeFloatId);
+		this.placeChart(box, img, origin);
+		// Presses on the image must not select cells or start editing them.
+		for (const type of ['mousedown', 'touchstart', 'dblclick', 'contextmenu'])
+			box.addEventListener(type, (e) => e.stopPropagation(), {
+				passive: true,
+			});
+		const file = this.app.vault.getAbstractFileByPath(img.path);
+		if (file instanceof TFile)
+			box.createEl('img', {
+				attr: {
+					src: this.app.vault.getResourcePath(file),
+					alt: file.name,
+					draggable: 'false',
+				},
+			});
+		else box.createDiv({ cls: 'rtl-sheet-float-missing', text: 'Missing image' });
+
+		const deleteBtn = box.createEl('button', {
+			cls: 'rtl-sheet-float-btn',
+			attr: { 'aria-label': 'Delete image', title: 'Delete image' },
+		});
+		setIcon(deleteBtn, 'trash-2');
+		deleteBtn.addEventListener('click', () => this.deleteFloatingImage(img.id));
+		const grip = box.createDiv({
+			cls: 'rtl-sheet-chart-grip',
+			attr: { 'aria-label': 'Resize image' },
+		});
+		const drag = (e: PointerEvent, mode: 'move' | 'resize'): void => {
+			e.stopPropagation();
+			this.setActiveFloat(img.id);
+			this.hot?.listen(); // Delete removes the image
+			this.dragBox(
+				e,
+				box,
+				img,
+				mode,
+				{ w: FLOAT_MIN_PX, h: FLOAT_MIN_PX },
+				true,
+				(next) => this.replaceFloatingImage(img.id, (f) => ({ ...f, ...next })),
+			);
+		};
+		grip.addEventListener('pointerdown', (e) => drag(e, 'resize'));
+		box.addEventListener('pointerdown', (e) => {
+			if (e.target === grip) return;
+			drag(e, 'move');
+		});
+	}
+
+	/** Marks the floating image that Delete removes (null: none) without drawing every chart again. */
+	private setActiveFloat(id: string | null): void {
+		if (this.activeFloatId === id) return;
+		this.activeFloatId = id;
+		this.chartLayer
+			?.querySelectorAll('.rtl-sheet-float-img')
+			.forEach((el, i) =>
+				el.toggleClass(
+					'is-active',
+					this.model.floatingImages[i]?.id === id && id !== null,
+				),
+			);
+	}
+
+	/** Floating images are replaced, never changed in place (undo compares them). */
+	private replaceFloatingImage(
+		id: string,
+		change: (img: FloatingImage) => FloatingImage | null,
+	): void {
+		const images: FloatingImage[] = [];
+		for (const img of this.model.floatingImages) {
+			if (img.id !== id) {
+				images.push(img);
+				continue;
+			}
+			const next = change(img);
+			if (next) images.push(next);
+		}
+		this.model.floatingImages = images;
+		this.markDirty();
+		this.queueCharts();
+	}
+
+	private deleteFloatingImage(id: string): void {
+		if (this.activeFloatId === id) this.activeFloatId = null;
+		this.replaceFloatingImage(id, () => null);
+		new Notice('Image deleted. Undo (Ctrl+Z) brings it back.');
+	}
+
+	/* ---------------- Emoji ---------------- */
+
+	/** Inserts emojis where the user is typing (cell editor or formula bar), else at the end of the selected cell. */
+	private openEmojiPicker(anchor: HTMLElement): void {
+		const active = this.activeFormulaField();
+		const field = active?.field ?? null;
+		const caret = field
+			? {
+					from: field.selectionStart ?? field.value.length,
+					to: field.selectionEnd ?? field.value.length,
+				}
+			: null;
+		const cell = active?.cell ?? this.formulaCell;
+		if (!field && !cell) {
+			new Notice('Select a cell first.');
+			return;
+		}
+		// The search box gets the keys; the grid gets them back when the picker closes.
+		this.hot?.unlisten();
+		this.emojiPicker.open(
+			anchor,
+			this.plugin.settings.recentEmojis,
+			(emoji) => {
+				this.rememberEmoji(emoji);
+				if (field && caret && this.isStillEditing(field)) {
+					field.focus();
+					field.value =
+						field.value.slice(0, caret.from) +
+						emoji +
+						field.value.slice(caret.to);
+					caret.from = caret.to = caret.from + emoji.length;
+					field.setSelectionRange(caret.from, caret.to);
+					field.dispatchEvent(new Event('input', { bubbles: true }));
+				} else if (cell) {
+					this.appendToCell(cell, emoji);
+				}
+			},
+			() => {
+				if (field && this.isStillEditing(field)) field.focus();
+				if (field !== this.ui.formulaInput) this.hot?.listen();
+			},
+		);
+	}
+
+	/** True while `field` is the formula bar, or the cell editor and it is still open. */
+	private isStillEditing(field: HTMLInputElement | HTMLTextAreaElement): boolean {
+		if (field === this.ui.formulaInput) return field.isConnected;
+		const editor = this.hot?.getActiveEditor() as unknown as
+			| { isOpened?: () => boolean; TEXTAREA?: HTMLTextAreaElement }
+			| undefined;
+		return !!editor?.isOpened?.() && editor.TEXTAREA === field;
+	}
+
+	private appendToCell(cell: { row: number; col: number }, text: string): void {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) return;
+		const current: unknown = hot.getSourceDataAtCell(cell.row, cell.col);
+		if (typeof current === 'string' && current.startsWith('=')) {
+			new Notice('The cell holds a formula: edit it to add an emoji.');
+			return;
+		}
+		hot.setDataAtCell(cell.row, cell.col, sourceText(current) + text);
+	}
+
+	private rememberEmoji(emoji: string): void {
+		const s = this.plugin.settings;
+		s.recentEmojis = [emoji, ...s.recentEmojis.filter((e) => e !== emoji)].slice(
+			0,
+			MAX_RECENT_EMOJIS,
+		);
+		void this.plugin
+			.saveSettings()
+			.catch((e) => console.warn('[Free-Excel] Could not save the emojis', e));
+	}
+
+	/* ---------------- Check boxes ---------------- */
+
+	/** Turns the selected cells into check boxes, or back into plain cells when the first one is a check box. */
+	private toggleCheckboxes(): void {
+		const ranges = this.requireSelection();
+		const hot = this.hot;
+		const first = ranges[0];
+		if (!first || !hot || hot.isDestroyed) return;
+		const on = !this.model.cellFormats[key(first.r1, first.c1)]?.checkbox;
+		if (on) {
+			// Empty cells and TRUE/FALSE-like text become real TRUE/FALSE values.
+			const changes: [number, number, Scalar][] = [];
+			for (const rg of ranges)
+				for (let r = rg.r1; r <= rg.r2; r++)
+					for (let c = rg.c1; c <= rg.c2; c++) {
+						const v: unknown = hot.getSourceDataAtCell(r, c);
+						if (typeof v === 'boolean') continue;
+						const text = sourceText(v).trim();
+						if (text === '' || /^(true|false|1|0)$/i.test(text))
+							changes.push([r, c, isChecked(text)]);
+					}
+			if (changes.length > 0) hot.setDataAtCell(changes, 'checkbox');
+		}
+		this.applyFormat(ranges, (f) => {
+			if (on) f.checkbox = true;
+			else delete f.checkbox;
+		});
+	}
+
+	/** The selected cells that show a check box. */
+	private selectedCheckboxCells(): { row: number; col: number }[] {
+		const out: { row: number; col: number }[] = [];
+		for (const rg of this.getSelectedRanges())
+			for (let r = rg.r1; r <= rg.r2; r++)
+				for (let c = rg.c1; c <= rg.c2; c++)
+					if (this.model.cellFormats[key(r, c)]?.checkbox)
+						out.push({ row: r, col: c });
+		return out;
+	}
+
+	/** Checks the boxes, or unchecks them all when the first one is checked. */
+	private toggleCheckboxCells(cells: { row: number; col: number }[]): void {
+		const hot = this.hot;
+		const first = cells[0];
+		if (!hot || hot.isDestroyed || !first) return;
+		const isFormula = (c: { row: number; col: number }): boolean => {
+			const v: unknown = hot.getSourceDataAtCell(c.row, c.col);
+			return typeof v === 'string' && v.startsWith('=');
+		};
+		const free = cells.filter((c) => !isFormula(c));
+		if (free.length === 0) {
+			new Notice('This check box is set by a formula.');
+			return;
+		}
+		const next = !isChecked(
+			this.resolveRaw(hot.getSourceDataAtCell(first.row, first.col), 0, false, first),
+		);
+		hot.setDataAtCell(
+			free.map((c): [number, number, Scalar] => [c.row, c.col, next]),
+			'checkbox',
+		);
+	}
+
+	private onCheckboxPress(e: PointerEvent): void {
+		this.checkboxPress = null;
+		if (e.pointerType === 'mouse' && e.button !== 0) return;
+		if (!(e.target instanceof HTMLElement) || !e.target.closest('.rtl-sheet-checkbox'))
+			return;
+		if (this.refPickTarget(e)) return; // the click puts a reference into a formula
+		const cell = this.cellFromEvent(e);
+		if (cell)
+			this.checkboxPress = {
+				...cell,
+				x: e.clientX,
+				y: e.clientY,
+				pointerId: e.pointerId,
+			};
+	}
+
+	private onCheckboxRelease(e: PointerEvent): void {
+		const press = this.checkboxPress;
+		this.checkboxPress = null;
+		if (!press || press.pointerId !== e.pointerId) return;
+		if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 8) return;
+		this.toggleCheckboxCells([{ row: press.row, col: press.col }]);
+	}
+
+	/** Check boxes change through toggleCheckboxCells only; Ctrl+click opens a link. */
+	private onGridClick(e: MouseEvent): void {
+		const target = e.target instanceof HTMLElement ? e.target : null;
+		if (target?.closest('.rtl-sheet-checkbox')) {
+			e.preventDefault();
+			return;
+		}
+		const mod = Platform.isMacOS ? e.metaKey : e.ctrlKey;
+		if (!mod || !target?.closest('.rtl-sheet-link')) return;
+		const cell = this.cellFromEvent(e);
+		const link = cell ? this.model.links[key(cell.row, cell.col)] : undefined;
+		if (!link) return;
+		e.preventDefault();
+		e.stopPropagation();
+		this.openLink(link);
+	}
+
+	/* ---------------- Links ---------------- */
+
+	private editLink(): void {
+		const hot = this.hot;
+		const cell = this.formulaCell;
+		if (!hot || hot.isDestroyed || !cell) {
+			new Notice('Select a cell first.');
+			return;
+		}
+		const k = key(cell.row, cell.col);
+		const current = this.model.links[k];
+		const raw: unknown = hot.getSourceDataAtCell(cell.row, cell.col);
+		const isFormula = typeof raw === 'string' && raw.startsWith('=');
+		const text = isFormula ? '' : sourceText(raw);
+		new LinkModal(
+			this.app,
+			`${indexToColumnLabel(cell.col)}${cell.row + 1}`,
+			{ text, target: current ?? '' },
+			!!current,
+			(link) => {
+				if (!this.hot || this.hot.isDestroyed) return;
+				const links = { ...this.model.links };
+				if (link) links[k] = link.target;
+				else delete links[k];
+				this.model.links = links;
+				// A formula keeps working: its result becomes the text of the link.
+				if (link && !isFormula && link.text !== text)
+					this.hot.setDataAtCell(cell.row, cell.col, link.text);
+				this.hot.render();
+				this.markDirty();
+				this.refreshCellInfo();
+			},
+		).open();
+	}
+
+	/** The address a link gets in an .xlsx file: notes open in Obsidian. */
+	private excelLinkTarget(target: string): string {
+		if (isExternalLink(target)) return target;
+		return `obsidian://open?vault=${encodeURIComponent(this.app.vault.getName())}&file=${encodeURIComponent(target)}`;
+	}
+
+	private openLink(target: string): void {
+		if (isExternalLink(target)) {
+			window.open(target);
+			return;
+		}
+		void this.app.workspace.openLinkText(target, this.file?.path ?? '', 'tab');
+	}
+
+	/* ---------------- Comments ---------------- */
+
+	private editComment(cell = this.formulaCell): void {
+		if (!cell) {
+			new Notice('Select a cell first.');
+			return;
+		}
+		new CommentModal(
+			this.app,
+			`${indexToColumnLabel(cell.col)}${cell.row + 1}`,
+			this.model.comments[key(cell.row, cell.col)] ?? null,
+			(comment) => this.setComment(cell, comment),
+		).open();
+	}
+
+	/** Comments are replaced, never changed in place (undo compares them). */
+	private setComment(
+		cell: { row: number; col: number },
+		comment: CellComment | null,
+	): void {
+		const comments = { ...this.model.comments };
+		if (comment) comments[key(cell.row, cell.col)] = comment;
+		else delete comments[key(cell.row, cell.col)];
+		this.model.comments = comments;
+		this.hot?.render();
+		this.markDirty();
+		this.refreshCellInfo();
+		this.refreshSidePanel();
+	}
+
+	private hasCellInfo(cell: { row: number; col: number }): boolean {
+		const k = key(cell.row, cell.col);
+		return !!(this.model.comments[k] || this.model.links[k]);
+	}
+
+	/** Updates the popup after `delay` ms, so moving over cells without a comment does not make it flicker. */
+	private queueCellInfo(delay = 200): void {
+		window.clearTimeout(this.cellInfoTimer);
+		this.cellInfoTimer = window.setTimeout(() => this.refreshCellInfo(), delay);
+	}
+
+	/**
+	 * Shows the comment and link of the cell under the pointer, or else of the selected cell,
+	 * in a small popup next to it (like Excel). Hidden when neither has one.
+	 */
+	private refreshCellInfo(): void {
+		window.clearTimeout(this.cellInfoTimer);
+		const el = this.cellInfoEl;
+		const hot = this.hot;
+		const pick = (c: { row: number; col: number } | null) =>
+			c && this.hasCellInfo(c) ? c : null;
+		// While the pointer is on the popup it stays on its cell (its content may have changed).
+		const cell =
+			!hot || hot.isDestroyed || this.isEditing()
+				? null
+				: this.cellInfoHovered && this.cellInfoCell
+					? pick(this.cellInfoCell)
+					: (pick(this.hoverCell) ?? pick(this.formulaCell));
+		if (!cell) this.cellInfoHovered = false;
+		this.cellInfoCell = cell;
+		el.empty();
+		if (!cell) {
+			el.hide();
+			return;
+		}
+		const k = key(cell.row, cell.col);
+		const comment = this.model.comments[k];
+		const link = this.model.links[k];
+		if (comment) {
+			const box = el.createDiv({ cls: 'rtl-sheet-info-comment' });
+			box.setCssProps({ '--rtl-sheet-comment-color': comment.color });
+			box.createDiv({
+				cls: 'rtl-sheet-info-text',
+				text: comment.text,
+				attr: { dir: 'auto' },
+			});
+			const foot = box.createDiv({ cls: 'rtl-sheet-info-foot' });
+			foot.createSpan({
+				cls: 'rtl-sheet-info-time',
+				text: comment.time ? new Date(comment.time).toLocaleString() : '',
+			});
+			this.infoButton(foot, 'pencil', 'Edit comment', () =>
+				this.editComment(cell),
+			);
+			this.infoButton(foot, 'trash-2', 'Delete comment', () =>
+				this.setComment(cell, null),
+			);
+		}
+		if (link) {
+			const row = el.createDiv({ cls: 'rtl-sheet-info-link' });
+			setIcon(row.createSpan({ cls: 'rtl-sheet-info-icon' }), 'link');
+			const a = row.createEl('a', {
+				text: link,
+				href: isExternalLink(link) ? link : '#',
+				attr: { dir: 'auto', title: link },
+			});
+			a.addEventListener('click', (e) => {
+				e.preventDefault();
+				this.openLink(link);
+			});
+			this.infoButton(row, 'pencil', 'Edit link', () => {
+				this.hot?.selectCell(cell.row, cell.col);
+				this.editLink();
+			});
+		}
+		el.show();
+		this.positionCellInfo();
+	}
+
+	private infoButton(
+		parent: HTMLElement,
+		icon: string,
+		label: string,
+		onClick: () => void,
+	): void {
+		const btn = parent.createEl('button', {
+			cls: 'rtl-sheet-info-btn',
+			attr: { 'aria-label': label, title: label },
+		});
+		setIcon(btn, icon);
+		btn.addEventListener('click', onClick);
+	}
+
+	/** Places the popup beside its cell (on the side away from the first column), inside the grid. */
+	private positionCellInfo(): void {
+		const el = this.cellInfoEl;
+		const cell = this.cellInfoCell;
+		const hot = this.hot;
+		if (!cell || !el.isShown() || !hot || hot.isDestroyed) return;
+		const td = hot.getCell(cell.row, cell.col, true);
+		const grid = this.gridEl.getBoundingClientRect();
+		const rect = td?.getBoundingClientRect();
+		if (
+			!rect ||
+			rect.bottom < grid.top ||
+			rect.top > grid.bottom ||
+			rect.right < grid.left ||
+			rect.left > grid.right
+		) {
+			el.addClass('is-offscreen');
+			return;
+		}
+		el.removeClass('is-offscreen');
+		const host = this.contentEl.getBoundingClientRect();
+		const width = el.offsetWidth;
+		const height = el.offsetHeight;
+		const after = rect.right - host.left + 4;
+		const before = rect.left - host.left - width - 4;
+		let left = this.model.rtl ? before : after;
+		if (left + width > host.width - 4) left = before;
+		if (left < 4) left = Math.min(after, host.width - width - 4);
+		let top = rect.top - host.top;
+		top = Math.max(4, Math.min(top, host.height - height - 4));
+		el.style.left = `${Math.max(4, left)}px`;
+		el.style.top = `${top}px`;
+	}
+
+	/* ---------------- Side panel (comments, AI) ---------------- */
+
+	private toggleSidePanel(kind: 'comments' | 'ai'): void {
+		if (this.sidePanel === kind) this.closeSidePanel();
+		else this.openSidePanel(kind);
+	}
+
+	private openSidePanel(kind: 'comments' | 'ai'): void {
+		this.sidePanel = kind;
+		this.sidePanelEl.show();
+		this.commentsPanelEl.toggle(kind === 'comments');
+		this.aiPanelEl.toggle(kind === 'ai');
+		if (kind === 'comments') this.renderCommentsPanel();
+		else {
+			if (!this.aiPanel)
+				this.aiPanel = new AiAssistantPanel(this.aiPanelEl, {
+					app: this.app,
+					component: this,
+					sourcePath: () => this.file?.path ?? '',
+					settings: () => this.plugin.settings,
+					describeSheet: () => this.describeSheetForAi(),
+					tools: AI_TOOLS,
+					runTool: (name, input) => this.runAiTool(name, input),
+					close: () => this.closeSidePanel(),
+				});
+			if (!IS_TOUCH) this.aiPanel.focus();
+		}
+		this.onResize();
+	}
+
+	private closeSidePanel(): void {
+		if (!this.sidePanel) return;
+		this.sidePanel = null;
+		this.sidePanelEl.hide();
+		this.onResize();
+		this.hot?.listen();
+	}
+
+	private refreshSidePanel(): void {
+		if (this.sidePanel === 'comments') this.renderCommentsPanel();
+	}
+
+	/** Every comment of the shown sheet, in row order; a click selects its cell. */
+	private renderCommentsPanel(): void {
+		const el = this.commentsPanelEl;
+		el.empty();
+		const entries = Object.entries(this.model.comments)
+			.map(([k, comment]) => {
+				const parts = k.split(',').map(Number);
+				return { row: parts[0] ?? 0, col: parts[1] ?? 0, comment };
+			})
+			.sort((a, b) => a.row - b.row || a.col - b.col);
+		const head = el.createDiv({ cls: 'rtl-sheet-side-head' });
+		const title = head.createDiv({ cls: 'rtl-sheet-side-title' });
+		setIcon(title.createSpan(), 'messages-square');
+		title.createSpan({ text: `Comments (${entries.length})` });
+		const closeBtn = head.createEl('button', {
+			cls: 'rtl-sheet-side-btn',
+			attr: { 'aria-label': 'Close', title: 'Close' },
+		});
+		setIcon(closeBtn, 'x');
+		closeBtn.addEventListener('click', () => this.closeSidePanel());
+
+		const list = el.createDiv({ cls: 'rtl-sheet-comment-list' });
+		if (entries.length === 0) {
+			list.createDiv({
+				cls: 'rtl-sheet-side-empty',
+				text: 'No comments in this sheet. Select a cell and choose "Add comment".',
+			});
+			return;
+		}
+		for (const { row, col, comment } of entries) {
+			const item = list.createDiv({ cls: 'rtl-sheet-comment-item' });
+			item.setCssProps({ '--rtl-sheet-comment-color': comment.color });
+			const top = item.createDiv({ cls: 'rtl-sheet-comment-item-head' });
+			top.createSpan({
+				cls: 'rtl-sheet-comment-cell',
+				text: `${indexToColumnLabel(col)}${row + 1}`,
+			});
+			top.createSpan({
+				cls: 'rtl-sheet-info-time',
+				text: comment.time ? new Date(comment.time).toLocaleDateString() : '',
+			});
+			this.infoButton(top, 'pencil', 'Edit comment', () =>
+				this.editComment({ row, col }),
+			);
+			this.infoButton(top, 'trash-2', 'Delete comment', () =>
+				this.setComment({ row, col }, null),
+			);
+			item.createDiv({
+				cls: 'rtl-sheet-info-text',
+				text: comment.text,
+				attr: { dir: 'auto' },
+			});
+			item.addEventListener('click', (e) => {
+				if (e.target instanceof HTMLElement && e.target.closest('button')) return;
+				const hot = this.hot;
+				if (!hot || hot.isDestroyed) return;
+				hot.selectCell(row, col);
+				hot.scrollViewportTo({ row, col });
+				hot.listen();
+			});
+		}
+	}
+
+	/* ---------------- AI ---------------- */
+
+	private openPluginSettings(): void {
+		const setting = (
+			this.app as unknown as {
+				setting?: { open(): void; openTabById(id: string): void };
+			}
+		).setting;
+		setting?.open();
+		setting?.openTabById(this.plugin.manifest.id);
+	}
+
+	/** Starts a CLAUDE() or GEMINI() formula in the formula bar of the selected cell. */
+	private insertAiFormula(name: 'CLAUDE' | 'GEMINI'): void {
+		const fn = FORMULA_FUNCTIONS.find((f) => f.name === name);
+		const provider = name === 'CLAUDE' ? 'claude' : 'gemini';
+		if (!aiApiKey(this.app, this.plugin.settings, provider))
+			new Notice(
+				`Add a ${name === 'CLAUDE' ? 'Claude' : 'Gemini'} API key in the settings, or the formula shows ${AI_ERROR_TEXT}.`,
+			);
+		if (fn) this.insertFunction(fn);
+	}
+
+	/** Forgets the answers of the AI formulas in the selection, so they are asked again. */
+	private refreshAiFormulas(): void {
+		const ranges = this.requireSelection();
+		const hot = this.hot;
+		if (ranges.length === 0 || !hot || hot.isDestroyed) return;
+		const cells: string[] = [];
+		for (const rg of ranges)
+			for (let r = rg.r1; r <= rg.r2; r++)
+				for (let c = rg.c1; c <= rg.c2; c++)
+					cells.push(`${this.activeSheet}!${key(r, c)}`);
+		this.aiRunner.retryFailed();
+		const count = this.aiRunner.refreshCells(cells);
+		this.invalidateRowSizes();
+		hot.render();
+		this.markDirty();
+		new Notice(
+			count > 0
+				? `Asking again for ${count} AI formula answer(s).`
+				: 'There are no AI formula answers in the selection.',
+		);
+	}
+
+	/** A cell for the AI: its text, and for a formula the formula and its result. */
+	private aiCellText(sheet: number, row: number, col: number): string {
+		const raw = this.rawCell(sheet, row, col);
+		const shown = this.resolveRaw(raw, 0, false, { row, col }, sheet);
+		const text = shown === null ? '' : String(shown);
+		if (typeof raw === 'string' && raw.startsWith('=') && raw.length > 1)
+			return `${raw} → ${text}`;
+		return text;
+	}
+
+	/** The sheet as text for the assistant: names, size, selection and the cells in use. */
+	private describeSheetForAi(): string {
+		const hot = this.hot;
+		const lines: string[] = [];
+		lines.push(
+			`Shown sheet: "${this.model.name}" (sheets in the file: ${this.sheets.map((s) => `"${s.name}"`).join(', ')})`,
+		);
+		if (this.model.rtl) lines.push('Layout: right-to-left (Hebrew/Arabic).');
+		if (!hot || hot.isDestroyed) return lines.join('\n');
+		lines.push(`Grid size: ${hot.countRows()} rows × ${hot.countCols()} columns.`);
+		const selected = this.getSelectedRanges().map(rangeLabel);
+		lines.push(`Selected: ${selected.length > 0 ? selected.join(', ') : 'nothing'}.`);
+
+		const lastRow = this.lastDataRow(hot);
+		let lastCol = -1;
+		for (let r = 0; r <= lastRow; r++) {
+			const row = hot.getSourceDataAtRow(r) as unknown[];
+			for (let c = row.length - 1; c > lastCol; c--)
+				if (row[c] !== null && row[c] !== undefined && row[c] !== '') {
+					lastCol = c;
+					break;
+				}
+		}
+		if (lastRow < 0 || lastCol < 0) {
+			lines.push('The sheet is empty.');
+		} else {
+			const rows = Math.min(lastRow, AI_CONTEXT_ROWS - 1);
+			const cols = Math.min(lastCol, AI_CONTEXT_COLS - 1);
+			lines.push(
+				`Cells in use: ${rangeLabel({ r1: 0, c1: 0, r2: lastRow, c2: lastCol })}. A formula is shown as "=FORMULA → result". Columns are separated by tabs:`,
+			);
+			const header = ['row'];
+			for (let c = 0; c <= cols; c++) header.push(indexToColumnLabel(c));
+			lines.push(header.join('\t'));
+			for (let r = 0; r <= rows; r++) {
+				const cells = [String(r + 1)];
+				for (let c = 0; c <= cols; c++)
+					cells.push(
+						this.aiCellText(this.activeSheet, r, c)
+							.replace(/[\t\n\r]+/g, ' ')
+							.slice(0, AI_CONTEXT_CELL_CHARS),
+					);
+				lines.push(cells.join('\t'));
+			}
+			if (rows < lastRow || cols < lastCol)
+				lines.push('(Only part of the cells is shown: use read_range for the rest.)');
+		}
+		const formats = Object.entries(this.model.cellFormats)
+			.filter(([, f]) => f.checkbox)
+			.map(([k]) => {
+				const parts = k.split(',').map(Number);
+				return `${indexToColumnLabel(parts[1] ?? 0)}${(parts[0] ?? 0) + 1}`;
+			});
+		if (formats.length > 0)
+			lines.push(`Check box cells (TRUE = checked): ${formats.slice(0, 200).join(', ')}`);
+		const comments = Object.entries(this.model.comments).slice(0, 100);
+		if (comments.length > 0) {
+			lines.push('Comments:');
+			for (const [k, c] of comments) {
+				const parts = k.split(',').map(Number);
+				lines.push(
+					`${indexToColumnLabel(parts[1] ?? 0)}${(parts[0] ?? 0) + 1}: ${c.text.replace(/\s+/g, ' ')}`,
+				);
+			}
+		}
+		const cellImages = Object.entries(this.model.images).slice(0, 50);
+		if (cellImages.length > 0)
+			lines.push(
+				`Images in cells: ${cellImages
+					.map(([k, path]) => {
+						const parts = k.split(',').map(Number);
+						return `${indexToColumnLabel(parts[1] ?? 0)}${(parts[0] ?? 0) + 1} = ${path}`;
+					})
+					.join('; ')}`,
+			);
+		if (this.model.floatingImages.length > 0)
+			lines.push(
+				`Floating images: ${this.model.floatingImages.map((f) => f.path).slice(0, 50).join('; ')}`,
+			);
+		if (this.model.charts.length > 0)
+			lines.push(
+				`Charts: ${this.model.charts.map((c) => `${c.type} of ${rangeLabel(c.range)}${c.title ? ` "${c.title}"` : ''}`).join('; ')}`,
+			);
+		return lines.join('\n');
+	}
+
+	/** Runs a tool call of the assistant on the shown sheet. Errors are thrown with a message for the model. */
+	private runAiTool(
+		name: string,
+		input: Record<string, unknown>,
+	): AiToolResult | Promise<AiToolResult> {
+		const hot = this.hot;
+		if (!hot || hot.isDestroyed) throw new Error('The sheet is not ready.');
+		const text = (k: string): string => {
+			const v = input[k];
+			return typeof v === 'string' ? v : typeof v === 'number' ? String(v) : '';
+		};
+		const range = (k = 'range'): SelRange => {
+			const rg = parseRangeRef(text(k));
+			if (!rg) throw new Error(`"${text(k)}" is not a cell or range in A1 notation.`);
+			return rg;
+		};
+		const cellOf = (k: string): { row: number; col: number } => {
+			const rg = range(k);
+			return { row: rg.r1, col: rg.c1 };
+		};
+		/** Adds rows and columns so the range fits in the grid. */
+		const fit = (rg: SelRange): void => {
+			const rows = rg.r2 + 1 - hot.countRows();
+			if (rows > 0) hot.alter('insert_row_below', hot.countRows() - 1, rows);
+			const cols = rg.c2 + 1 - hot.countCols();
+			if (cols > 0) hot.alter('insert_col_end', hot.countCols() - 1, cols);
+		};
+		const flag = (k: string): boolean | undefined => {
+			const v = input[k];
+			return typeof v === 'boolean' ? v : undefined;
+		};
+		/** Where an image tool puts its image: the given cell, else the selected one, else A1. */
+		const imageCell = (): { row: number; col: number } => {
+			if (text('cell')) {
+				const cell = cellOf('cell');
+				fit({ r1: cell.row, c1: cell.col, r2: cell.row, c2: cell.col });
+				return cell;
+			}
+			const sel = this.getSelectedRanges()[0];
+			return sel ? { row: sel.r1, col: sel.c1 } : { row: 0, col: 0 };
+		};
+
+		switch (name) {
+			case 'read_range': {
+				const sheetName = text('sheet');
+				const sheet = sheetName ? this.sheetIndexByName(sheetName) : this.activeSheet;
+				if (sheet < 0) throw new Error(`There is no sheet named "${sheetName}".`);
+				const rg = range();
+				const width = rg.c2 - rg.c1 + 1;
+				const r2 = Math.min(rg.r2, rg.r1 + Math.max(0, Math.floor(AI_MAX_READ_CELLS / width) - 1));
+				const rows: string[][] = [];
+				for (let r = rg.r1; r <= r2; r++) {
+					const row: string[] = [];
+					for (let c = rg.c1; c <= rg.c2; c++) row.push(this.aiCellText(sheet, r, c));
+					rows.push(row);
+				}
+				const read = { ...rg, r2 };
+				return {
+					result: {
+						range: rangeLabel(read),
+						rows,
+						...(r2 < rg.r2 ? { note: 'Cut short: read the rest separately.' } : {}),
+					},
+					summary: `Read ${sheetName ? `${sheetName}!` : ''}${rangeLabel(read)}`,
+				};
+			}
+			case 'write_cells': {
+				const start = cellOf('start');
+				const raw = input.rows;
+				if (!Array.isArray(raw)) throw new Error('"rows" must be a list of rows.');
+				const changes: [number, number, Scalar][] = [];
+				let width = 0;
+				raw.forEach((row: unknown, i) => {
+					const cells = Array.isArray(row) ? row : [row];
+					width = Math.max(width, cells.length);
+					cells.forEach((v: unknown, j) => {
+						const value =
+							v === null || v === undefined || v === ''
+								? null
+								: typeof v === 'boolean' || typeof v === 'number'
+									? v
+									: typeof v === 'string'
+										? v
+										: JSON.stringify(v);
+						changes.push([start.row + i, start.col + j, value]);
+					});
+				});
+				if (changes.length === 0) throw new Error('Nothing to write.');
+				const rg = {
+					r1: start.row,
+					c1: start.col,
+					r2: start.row + raw.length - 1,
+					c2: start.col + Math.max(1, width) - 1,
+				};
+				fit(rg);
+				hot.setDataAtCell(changes, 'ai');
+				return { result: { written: rangeLabel(rg) }, summary: `Wrote ${rangeLabel(rg)}` };
+			}
+			case 'clear_range': {
+				const rg = range();
+				const changes: [number, number, Scalar][] = [];
+				for (let r = rg.r1; r <= Math.min(rg.r2, hot.countRows() - 1); r++)
+					for (let c = rg.c1; c <= Math.min(rg.c2, hot.countCols() - 1); c++)
+						changes.push([r, c, null]);
+				if (changes.length > 0) hot.setDataAtCell(changes, 'ai');
+				return { result: { cleared: rangeLabel(rg) }, summary: `Cleared ${rangeLabel(rg)}` };
+			}
+			case 'format_range': {
+				const rg = range();
+				fit(rg);
+				const color = (k: string): string | null | undefined => {
+					if (!(k in input)) return undefined;
+					const v = text(k).trim().toLowerCase();
+					if (v === '') return null;
+					if (!/^#[0-9a-f]{6}$/.test(v)) throw new Error(`${k} must be "#rrggbb".`);
+					return v;
+				};
+				const textColor = color('text_color');
+				const fillColor = color('fill_color');
+				const pick = <T extends string>(k: string, allowed: readonly T[]): T | '' | undefined => {
+					if (!(k in input)) return undefined;
+					const v = text(k);
+					if (v === '') return '';
+					if (!(allowed as readonly string[]).includes(v))
+						throw new Error(`${k} must be one of ${allowed.join(', ')}.`);
+					return v as T;
+				};
+				const align = pick('align', ['left', 'center', 'right'] as const);
+				const valign = pick('vertical_align', ['top', 'middle', 'bottom'] as const);
+				const wrap = pick('wrap', ['overflow', 'wrap', 'expand'] as const);
+				const size = typeof input.font_size === 'number' ? Math.round(input.font_size) : undefined;
+				this.applyFormat([rg], (f) => {
+					const set = (k: 'bold' | 'italic' | 'underline' | 'strike' | 'checkbox', v: boolean | undefined): void => {
+						if (v === true) f[k] = true;
+						else if (v === false) delete f[k];
+					};
+					set('bold', flag('bold'));
+					set('italic', flag('italic'));
+					set('underline', flag('underline'));
+					set('strike', flag('strikethrough'));
+					set('checkbox', flag('checkbox'));
+					if (textColor === null) delete f.textColor;
+					else if (textColor) f.textColor = textColor;
+					if (fillColor === null) delete f.bgColor;
+					else if (fillColor) f.bgColor = fillColor;
+					if (align === '') delete f.align;
+					else if (align) f.align = align;
+					if (valign === '') delete f.valign;
+					else if (valign) f.valign = valign;
+					if (wrap === '') delete f.wrap;
+					else if (wrap) f.wrap = wrap;
+					if (size !== undefined) {
+						if (size > 0) f.fontSize = Math.min(96, Math.max(6, size));
+						else delete f.fontSize;
+					}
+				});
+				const borders = pick('borders', ['all', 'outer', 'none'] as const);
+				if (borders) this.applyBorders(borders, [rg]);
+				return { result: { formatted: rangeLabel(rg) }, summary: `Formatted ${rangeLabel(rg)}` };
+			}
+			case 'set_comment': {
+				const cell = cellOf('cell');
+				const body = text('text').trim();
+				const color = text('color').toLowerCase();
+				this.setComment(
+					cell,
+					body
+						? {
+								text: body,
+								color: /^#[0-9a-f]{6}$/.test(color)
+									? color
+									: (this.model.comments[key(cell.row, cell.col)]?.color ??
+										DEFAULT_COMMENT_COLOR),
+								time: Date.now(),
+							}
+						: null,
+				);
+				const label = rangeLabel({ r1: cell.row, c1: cell.col, r2: cell.row, c2: cell.col });
+				return {
+					result: { ok: true },
+					summary: body ? `Comment on ${label}` : `Removed the comment on ${label}`,
+				};
+			}
+			case 'set_link': {
+				const cell = cellOf('cell');
+				const target = text('url').trim();
+				const links = { ...this.model.links };
+				if (target) links[key(cell.row, cell.col)] = target;
+				else delete links[key(cell.row, cell.col)];
+				this.model.links = links;
+				const shown = text('text').trim();
+				if (target && shown) hot.setDataAtCell(cell.row, cell.col, shown, 'ai');
+				else if (target && hot.getSourceDataAtCell(cell.row, cell.col) == null)
+					hot.setDataAtCell(cell.row, cell.col, target, 'ai');
+				hot.render();
+				this.markDirty();
+				const label = rangeLabel({ r1: cell.row, c1: cell.col, r2: cell.row, c2: cell.col });
+				return { result: { ok: true }, summary: target ? `Link in ${label}` : `Removed the link in ${label}` };
+			}
+			case 'insert_chart': {
+				const type = text('type') as ChartType;
+				if (!CHART_TYPES.some((t) => t.value === type))
+					throw new Error(`type must be one of ${CHART_TYPES.map((t) => t.value).join(', ')}.`);
+				const rg = range();
+				hot.selectCell(rg.r1, rg.c1, rg.r2, rg.c2);
+				this.insertChart(type);
+				const id = this.chartEditorId;
+				const title = text('title');
+				if (id && title) this.replaceChart(id, (c) => ({ ...c, title }));
+				return { result: { ok: true }, summary: `Inserted a ${type} chart of ${rangeLabel(rg)}` };
+			}
+			case 'find_images': {
+				const words = text('query').toLowerCase().split(/\s+/).filter(Boolean);
+				const files = this.app.vault
+					.getFiles()
+					.filter((f) => IMAGE_EXTENSIONS.includes(f.extension.toLowerCase()))
+					.map((f) => {
+						const path = f.path.toLowerCase();
+						return { f, score: words.filter((w) => path.includes(w)).length };
+					})
+					.filter((x) => words.length === 0 || x.score > 0)
+					.sort((a, b) => b.score - a.score || b.f.stat.mtime - a.f.stat.mtime)
+					.slice(0, AI_MAX_FOUND_IMAGES)
+					.map((x) => x.f.path);
+				return {
+					result: files.length > 0 ? { images: files } : { images: [], note: 'No image in the vault matches.' },
+					summary: `Found ${files.length} image(s)`,
+				};
+			}
+			case 'search_web_images': {
+				const query = text('query').trim();
+				if (!query) throw new Error('"query" is missing.');
+				return this.searchWebImages(query);
+			}
+			case 'insert_image': {
+				const source = text('source').trim();
+				if (!source) throw new Error('"source" is missing.');
+				return this.aiInsertImage(source, imageCell(), flag('floating') ?? false);
+			}
+			case 'generate_image': {
+				const prompt = text('prompt').trim();
+				if (!prompt) throw new Error('"prompt" is missing.');
+				return this.aiGenerateImage(prompt, imageCell(), flag('floating') ?? false);
+			}
+			case 'select_range': {
+				const rg = range();
+				hot.selectCell(rg.r1, rg.c1, rg.r2, rg.c2);
+				hot.scrollViewportTo({ row: rg.r1, col: rg.c1 });
+				return { result: { ok: true }, summary: `Selected ${rangeLabel(rg)}` };
+			}
+			default:
+				throw new Error(`Unknown tool "${name}".`);
+		}
+	}
+
+	/** Pictures on Wikimedia Commons that match a query (the search_web_images tool). */
+	private async searchWebImages(query: string): Promise<AiToolResult> {
+		const params = new URLSearchParams({
+			action: 'query',
+			format: 'json',
+			generator: 'search',
+			gsrsearch: `filetype:bitmap ${query}`,
+			gsrnamespace: '6',
+			gsrlimit: String(AI_MAX_WEB_IMAGES),
+			prop: 'imageinfo',
+			iiprop: 'url|size|mime',
+			iiurlwidth: String(AI_WEB_IMAGE_WIDTH),
+		});
+		const res = await requestUrl({
+			url: `https://commons.wikimedia.org/w/api.php?${params.toString()}`,
+			throw: false,
+		});
+		if (res.status >= 400) throw new Error(`The image search failed (${res.status}).`);
+		const pages = (
+			res.json as {
+				query?: {
+					pages?: Record<
+						string,
+						{
+							title?: string;
+							index?: number;
+							imageinfo?: { thumburl?: string; url?: string; width?: number; height?: number }[];
+						}
+					>;
+				};
+			}
+		).query?.pages;
+		const images = Object.values(pages ?? {})
+			.sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+			.flatMap((p) => {
+				const info = p.imageinfo?.[0];
+				const url = info?.thumburl ?? info?.url;
+				if (!url) return [];
+				return [
+					{
+						title: (p.title ?? '').replace(/^File:/, ''),
+						url,
+						size: `${info?.width ?? '?'}×${info?.height ?? '?'}`,
+					},
+				];
+			});
+		return {
+			result: images.length > 0 ? { images } : { images: [], note: 'Nothing found: try other (English) words.' },
+			summary: `Searched images for "${query}" (${images.length})`,
+		};
+	}
+
+	/** Puts a vault image or a downloaded one in a cell or over the sheet (the insert_image tool). */
+	private async aiInsertImage(
+		source: string,
+		cell: { row: number; col: number },
+		floating: boolean,
+	): Promise<AiToolResult> {
+		let path: string | null;
+		if (/^https?:\/\//i.test(source)) {
+			const res = await requestUrl({ url: source, throw: false });
+			if (res.status >= 400)
+				throw new Error(`Downloading the image failed (${res.status}).`);
+			const header = Object.entries(res.headers).find(
+				([name]) => name.toLowerCase() === 'content-type',
+			)?.[1];
+			const fileName = decodeURIComponent(
+				source.split(/[?#]/)[0]?.split('/').pop() ?? '',
+			);
+			const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
+			const type = header?.split(';')[0]?.trim().toLowerCase() ?? '';
+			if (!type.startsWith('image/') && !IMAGE_EXTENSIONS.includes(ext))
+				throw new Error(
+					`The address is not an image (${type || 'unknown type'}). Use the address of the image file itself.`,
+				);
+			const blob = new Blob([res.arrayBuffer], {
+				type: type.startsWith('image/') ? type : `image/${ext.replace('jpg', 'jpeg')}`,
+			});
+			path = await this.saveImageBlob(
+				blob,
+				IMAGE_EXTENSIONS.includes(ext) ? fileName : null,
+			);
+			if (!path) throw new Error('Could not save the downloaded image in the vault.');
+		} else {
+			const file =
+				this.app.vault.getAbstractFileByPath(normalizePath(source)) ??
+				this.app.metadataCache.getFirstLinkpathDest(
+					source.replace(/^!?\[\[|\]\]$/g, ''),
+					this.file?.path ?? '',
+				);
+			if (!(file instanceof TFile) || !IMAGE_EXTENSIONS.includes(file.extension.toLowerCase()))
+				throw new Error(`There is no image "${source}" in the vault. Use find_images to look for one.`);
+			path = file.path;
+		}
+		return this.placeAiImage(path, cell, floating);
+	}
+
+	/** Makes a picture with Gemini and places it (the generate_image tool). */
+	private async aiGenerateImage(
+		prompt: string,
+		cell: { row: number; col: number },
+		floating: boolean,
+	): Promise<AiToolResult> {
+		const image = await generateGeminiImage(this.app, this.plugin.settings, prompt);
+		const ext = (image.mimeType.split('/')[1] ?? 'png').replace('jpeg', 'jpg');
+		const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+		const path = await this.saveImageBlob(
+			new Blob([image.data], { type: image.mimeType }),
+			`Generated image ${stamp}.${ext}`,
+		);
+		if (!path) throw new Error('Could not save the image in the vault.');
+		return this.placeAiImage(path, cell, floating);
+	}
+
+	private async placeAiImage(
+		path: string,
+		cell: { row: number; col: number },
+		floating: boolean,
+	): Promise<AiToolResult> {
+		const label = rangeLabel({ r1: cell.row, c1: cell.col, r2: cell.row, c2: cell.col });
+		if (floating) await this.addFloatingImage(path, cell);
+		else await this.setCellImage(path, cell);
+		return {
+			result: { ok: true, path, placed: floating ? `floating at ${label}` : `in ${label}` },
+			summary: floating ? `Floating image at ${label}` : `Image in ${label}`,
+		};
 	}
 
 	/* ---------------- Import ---------------- */
@@ -5651,12 +7501,24 @@ export class SheetView extends TextFileView {
 				this.importedCells(imp, ar, ac, keepFormulas),
 			);
 
-			for (const [k, f] of Object.entries(imp.formats)) {
+			const shifted = (k: string): string => {
 				const parts = k.split(',').map(Number);
-				const r = parts[0] ?? 0;
-				const c = parts[1] ?? 0;
-				this.model.cellFormats[key(r + ar, c + ac)] = f;
-			}
+				return key((parts[0] ?? 0) + ar, (parts[1] ?? 0) + ac);
+			};
+			for (const [k, f] of Object.entries(imp.formats))
+				this.model.cellFormats[shifted(k)] = f;
+			const comments = { ...this.model.comments };
+			for (const [k, text] of Object.entries(imp.comments))
+				comments[shifted(k)] = {
+					text,
+					color: DEFAULT_COMMENT_COLOR,
+					time: Date.now(),
+				};
+			this.model.comments = comments;
+			const links = { ...this.model.links };
+			for (const [k, target] of Object.entries(imp.links))
+				links[shifted(k)] = target;
+			this.model.links = links;
 
 			const mergePlugin = hot.getPlugin('mergeCells');
 			for (const mg of imp.merges) {
@@ -5787,6 +7649,12 @@ export class SheetView extends TextFileView {
 					if (hasValue) {
 						const value = this.toExcelValue(raw, r, c, sheetIndex);
 						cell.value = value;
+						const target = m.links[key(r, c)];
+						if (target && typeof value !== 'object')
+							cell.value = {
+								text: String(value),
+								hyperlink: this.excelLinkTarget(target),
+							};
 						isNumber =
 							typeof value === 'number' ||
 							(typeof value === 'object' &&
@@ -5860,23 +7728,17 @@ export class SheetView extends TextFileView {
 				);
 			}
 
+			for (const [k, comment] of Object.entries(m.comments)) {
+				const parts = k.split(',').map(Number);
+				ws.getCell((parts[0] ?? 0) + 1, (parts[1] ?? 0) + 1).note =
+					comment.text;
+			}
+
 			let skippedImages = 0;
 			for (const [k, path] of Object.entries(m.images)) {
 				const imageFile = this.app.vault.getAbstractFileByPath(path);
-				if (!(imageFile instanceof TFile)) {
-					skippedImages++;
-					continue;
-				}
-				const ext = imageFile.extension.toLowerCase();
-				const excelExt =
-					ext === 'png'
-						? 'png'
-						: ext === 'jpg' || ext === 'jpeg'
-							? 'jpeg'
-							: ext === 'gif'
-								? 'gif'
-								: null;
-				if (!excelExt) {
+				const excelExt = excelImageType(imageFile);
+				if (!(imageFile instanceof TFile) || !excelExt) {
 					skippedImages++; // webp/svg are not supported inside .xlsx files
 					continue;
 				}
@@ -5893,6 +7755,45 @@ export class SheetView extends TextFileView {
 					br: { col: c + 1, row: r + 1 },
 					editAs: 'oneCell',
 				} as unknown as Parameters<ExcelJS.Worksheet['addImage']>[1]);
+			}
+
+			// Floating images keep their place: px are turned into (fractional) columns and rows.
+			const colAt = (px: number): number => {
+				let c = 0;
+				let rest = px;
+				for (;;) {
+					const w = m.colWidths[c] || DEFAULT_COL_WIDTH;
+					if (rest < w) return c + rest / w;
+					rest -= w;
+					c++;
+				}
+			};
+			const rowAt = (px: number): number => {
+				let r = 0;
+				let rest = px;
+				for (;;) {
+					const h = m.rowHeights[r] || rowBaseHeight(defaultSizePx);
+					if (rest < h) return r + rest / h;
+					rest -= h;
+					r++;
+				}
+			};
+			for (const img of m.floatingImages) {
+				const imageFile = this.app.vault.getAbstractFileByPath(img.path);
+				const excelExt = excelImageType(imageFile);
+				if (!(imageFile instanceof TFile) || !excelExt) {
+					skippedImages++;
+					continue;
+				}
+				const imageId = wb.addImage({
+					buffer: await this.app.vault.readBinary(imageFile),
+					extension: excelExt,
+				});
+				ws.addImage(imageId, {
+					tl: { col: colAt(img.x), row: rowAt(img.y) },
+					ext: { width: img.w, height: img.h },
+					editAs: 'absolute',
+				});
 			}
 			return skippedImages;
 		}

@@ -5,13 +5,21 @@ import {
 	Setting,
 	SuggestModal,
 	TFile,
+	setIcon,
 } from 'obsidian';
+import { EMOJI_CATEGORIES, EmojiInfo, searchEmojis } from './emoji';
 import {
 	FORMULA_FUNCTIONS,
 	FormulaFunctionInfo,
 	buildFunctionCall,
 } from './formulas';
-import { ColumnFilter, FILTER_CONDITIONS, FilterCondition } from './model';
+import {
+	CellComment,
+	ColumnFilter,
+	DEFAULT_COMMENT_COLOR,
+	FILTER_CONDITIONS,
+	FilterCondition,
+} from './model';
 
 type TextField = HTMLInputElement | HTMLTextAreaElement;
 
@@ -668,6 +676,419 @@ export class ConfirmModal extends Modal {
 			.addButton((btn) =>
 				btn.setButtonText('Cancel').onClick(() => this.close()),
 			);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Emoji picker                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A popup with a search box and every emoji by category. It lives in <body> like the
+ * autocomplete list, and keeps its presses away from Handsontable so a cell being edited
+ * stays open.
+ */
+export class EmojiPicker {
+	private popup: HTMLElement | null = null;
+	private gridEl: HTMLElement | null = null;
+	private searchEl: HTMLInputElement | null = null;
+	/** Index into EMOJI_CATEGORIES; -1 = recently used. */
+	private category = 0;
+	private onPick: ((emoji: string) => void) | null = null;
+	private onClose: (() => void) | null = null;
+	private recent: string[] = [];
+
+	open(
+		anchor: HTMLElement,
+		recent: string[],
+		onPick: (emoji: string) => void,
+		onClose: () => void,
+	): void {
+		this.close();
+		this.recent = recent;
+		this.onPick = onPick;
+		this.onClose = onClose;
+		this.category = recent.length > 0 ? -1 : 0;
+		const doc = anchor.ownerDocument;
+		const popup = doc.body.createDiv({ cls: 'rtl-sheet-emoji-picker' });
+		this.popup = popup;
+		for (const type of [
+			'mousedown',
+			'pointerdown',
+			'touchstart',
+			'mouseup',
+			'pointerup',
+			'touchend',
+			'keydown',
+		])
+			popup.addEventListener(type, (e) => e.stopPropagation());
+
+		const search = popup.createEl('input', {
+			type: 'text',
+			cls: 'rtl-sheet-emoji-search',
+			attr: { placeholder: 'Search emojis', dir: 'auto' },
+		});
+		this.searchEl = search;
+		search.addEventListener('input', () => this.renderGrid());
+		search.addEventListener('keydown', (e) => {
+			if (e.key === 'Escape') this.close();
+			else if (e.key === 'Enter') {
+				e.preventDefault();
+				this.gridEl?.querySelector('button')?.click();
+			}
+		});
+
+		const tabs = popup.createDiv({ cls: 'rtl-sheet-emoji-tabs' });
+		const addTab = (index: number, icon: string, label: string): void => {
+			const tab = tabs.createEl('button', {
+				cls: 'rtl-sheet-emoji-tab',
+				attr: {
+					'aria-label': label,
+					title: label,
+					'data-index': String(index),
+				},
+			});
+			setIcon(tab, icon);
+			tab.addEventListener('mousedown', (e) => e.preventDefault());
+			tab.addEventListener('click', () => {
+				this.category = index;
+				search.value = '';
+				this.renderGrid();
+			});
+		};
+		if (recent.length > 0) addTab(-1, 'clock', 'Recently used');
+		EMOJI_CATEGORIES.forEach((c, i) => addTab(i, c.icon, c.name));
+
+		this.gridEl = popup.createDiv({ cls: 'rtl-sheet-emoji-grid' });
+		this.renderGrid();
+		this.position(anchor);
+		doc.addEventListener('pointerdown', this.onOutside, true);
+		// On phones the keyboard would cover the list: search only when the box is tapped.
+		if (!doc.body.hasClass('is-mobile')) search.focus();
+	}
+
+	close(): void {
+		const popup = this.popup;
+		if (!popup) return;
+		popup.ownerDocument.removeEventListener(
+			'pointerdown',
+			this.onOutside,
+			true,
+		);
+		popup.remove();
+		this.popup = null;
+		this.gridEl = null;
+		this.searchEl = null;
+		const onClose = this.onClose;
+		this.onClose = null;
+		this.onPick = null;
+		onClose?.();
+	}
+
+	private readonly onOutside = (e: PointerEvent): void => {
+		if (e.target instanceof Node && this.popup?.contains(e.target)) return;
+		this.close();
+	};
+
+	private renderGrid(): void {
+		const grid = this.gridEl;
+		if (!grid) return;
+		grid.empty();
+		const query = this.searchEl?.value.trim() ?? '';
+		let list: EmojiInfo[];
+		if (query) list = searchEmojis(query);
+		else if (this.category < 0)
+			list = this.recent.map((char) => ({ char, keywords: '' }));
+		else list = EMOJI_CATEGORIES[this.category]?.emojis ?? [];
+		this.popup
+			?.querySelectorAll<HTMLElement>('.rtl-sheet-emoji-tab')
+			.forEach((tab) =>
+				tab.toggleClass(
+					'is-active',
+					!query && tab.dataset.index === String(this.category),
+				),
+			);
+		if (list.length === 0) {
+			grid.createDiv({
+				cls: 'rtl-sheet-emoji-empty',
+				text: 'No emojis found.',
+			});
+			return;
+		}
+		for (const e of list) {
+			const hint = e.keywords || e.char;
+			const btn = grid.createEl('button', {
+				cls: 'rtl-sheet-emoji',
+				text: e.char,
+				attr: { title: hint, 'aria-label': hint },
+			});
+			btn.addEventListener('mousedown', (ev) => ev.preventDefault());
+			btn.addEventListener('click', (ev) => {
+				const pick = this.onPick;
+				// Shift+click adds several emojis without closing the picker.
+				if (!ev.shiftKey) this.close();
+				pick?.(e.char);
+			});
+		}
+	}
+
+	private position(anchor: HTMLElement): void {
+		const popup = this.popup;
+		if (!popup) return;
+		const win = anchor.ownerDocument.defaultView ?? window;
+		const rect = anchor.getBoundingClientRect();
+		const width = Math.min(340, win.innerWidth - 16);
+		popup.style.width = `${width}px`;
+		const height = popup.offsetHeight;
+		const left = Math.max(8, Math.min(rect.left, win.innerWidth - width - 8));
+		let top = rect.bottom + 4;
+		if (top + height > win.innerHeight - 8)
+			top = Math.max(8, rect.top - height - 4);
+		popup.style.left = `${left}px`;
+		popup.style.top = `${top}px`;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Comments and links                                                  */
+/* ------------------------------------------------------------------ */
+
+/** Colors offered for the corner mark of a comment. */
+const COMMENT_COLORS = [
+	DEFAULT_COMMENT_COLOR,
+	'#e03131',
+	'#2f9e44',
+	'#1971c2',
+	'#9c36b5',
+	'#868e96',
+];
+
+/** Writes or changes the comment of a cell. `onSave(null)` removes it. */
+export class CommentModal extends Modal {
+	private text: string;
+	private color: string;
+
+	constructor(
+		app: App,
+		private readonly cellLabel: string,
+		private readonly current: CellComment | null,
+		private readonly onSave: (comment: CellComment | null) => void,
+	) {
+		super(app);
+		this.text = current?.text ?? '';
+		this.color = current?.color ?? DEFAULT_COMMENT_COLOR;
+	}
+
+	onOpen(): void {
+		this.setTitle(
+			this.current
+				? `Edit comment on ${this.cellLabel}`
+				: `Add comment to ${this.cellLabel}`,
+		);
+		const { contentEl } = this;
+		contentEl.empty();
+		const area = contentEl.createEl('textarea', {
+			cls: 'rtl-sheet-comment-input',
+			attr: { placeholder: 'Comment', dir: 'auto', rows: '5' },
+		});
+		area.value = this.text;
+		area.addEventListener('input', () => {
+			this.text = area.value;
+		});
+		area.addEventListener('keydown', (e) => {
+			if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+				e.preventDefault();
+				this.save();
+			}
+		});
+
+		const colorRow = new Setting(contentEl)
+			.setName('Corner color')
+			.setDesc('The mark in the top right corner of the cell.');
+		const swatches = colorRow.controlEl.createDiv({
+			cls: 'rtl-sheet-comment-colors',
+		});
+		const picker = colorRow.controlEl.createEl('input', { type: 'color' });
+		picker.value = this.color;
+		const paint = (): void => {
+			swatches
+				.querySelectorAll<HTMLElement>('button')
+				.forEach((b) =>
+					b.toggleClass('is-active', b.dataset.color === this.color),
+				);
+		};
+		for (const color of COMMENT_COLORS) {
+			const b = swatches.createEl('button', {
+				cls: 'rtl-sheet-swatch',
+				attr: { 'aria-label': color, title: color, 'data-color': color },
+			});
+			b.setCssProps({ '--rtl-sheet-swatch': color });
+			b.addEventListener('click', () => {
+				this.color = color;
+				picker.value = color;
+				paint();
+			});
+		}
+		picker.addEventListener('input', () => {
+			this.color = picker.value.toLowerCase();
+			paint();
+		});
+		paint();
+
+		const buttons = new Setting(contentEl).addButton((btn) =>
+			btn
+				.setButtonText('Save')
+				.setCta()
+				.onClick(() => this.save()),
+		);
+		if (this.current)
+			buttons.addButton((btn) =>
+				btn
+					.setButtonText('Delete comment')
+					.setDestructive()
+					.onClick(() => {
+						this.close();
+						this.onSave(null);
+					}),
+			);
+		buttons.addButton((btn) =>
+			btn.setButtonText('Cancel').onClick(() => this.close()),
+		);
+		window.setTimeout(() => area.focus(), 0);
+	}
+
+	private save(): void {
+		const text = this.text.trim();
+		this.close();
+		this.onSave(text ? { text, color: this.color, time: Date.now() } : null);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+export interface LinkInput {
+	/** What the cell shows. */
+	text: string;
+	/** A web address, or the name or path of a note in the vault. */
+	target: string;
+}
+
+/** Puts a link in a cell: the text it shows and where it goes. `onSave(null)` removes the link. */
+export class LinkModal extends Modal {
+	private text: string;
+	private target: string;
+
+	constructor(
+		app: App,
+		private readonly cellLabel: string,
+		current: LinkInput,
+		private readonly hasLink: boolean,
+		private readonly onSave: (link: LinkInput | null) => void,
+	) {
+		super(app);
+		this.text = current.text;
+		this.target = current.target;
+	}
+
+	onOpen(): void {
+		this.setTitle(
+			`${this.hasLink ? 'Edit link in' : 'Insert link in'} ${this.cellLabel}`,
+		);
+		const { contentEl } = this;
+		contentEl.empty();
+		const submitOnEnter = (input: HTMLInputElement): void => {
+			input.setAttr('dir', 'auto');
+			input.addEventListener('keydown', (e) => {
+				if (e.key === 'Enter' && !e.isComposing) {
+					e.preventDefault();
+					this.save();
+				}
+			});
+		};
+		let textInput: HTMLInputElement | null = null;
+		new Setting(contentEl)
+			.setName('Text')
+			.setDesc('What the cell shows. Empty = the link itself.')
+			.addText((t) => {
+				textInput = t.inputEl;
+				t.setValue(this.text).onChange((v) => {
+					this.text = v;
+				});
+				submitOnEnter(t.inputEl);
+			});
+		let targetInput: HTMLInputElement | null = null;
+		new Setting(contentEl)
+			.setName('Link')
+			.setDesc('A web address or the name of a note in your vault.')
+			.addText((t) => {
+				targetInput = t.inputEl;
+				t.setPlaceholder('https://example.com or My note')
+					.setValue(this.target)
+					.onChange((v) => {
+						this.target = v;
+					});
+				submitOnEnter(t.inputEl);
+				window.setTimeout(() => t.inputEl.focus(), 0);
+			})
+			.addExtraButton((btn) =>
+				btn
+					.setIcon('file-search')
+					.setTooltip('Choose a note')
+					.onClick(() => {
+						new VaultFilePickerModal(
+							this.app,
+							['md', 'canvas', 'pdf', 'sheet', 'rtlsheet'],
+							'Choose a note to link to…',
+							(file) => {
+								this.target =
+									file.extension === 'md'
+										? file.path.slice(0, -3)
+										: file.path;
+								if (targetInput) targetInput.value = this.target;
+								if (!this.text.trim()) {
+									this.text = file.basename;
+									if (textInput) textInput.value = this.text;
+								}
+							},
+						).open();
+					}),
+			);
+		const buttons = new Setting(contentEl).addButton((btn) =>
+			btn
+				.setButtonText('Save')
+				.setCta()
+				.onClick(() => this.save()),
+		);
+		if (this.hasLink)
+			buttons.addButton((btn) =>
+				btn
+					.setButtonText('Remove link')
+					.setDestructive()
+					.onClick(() => {
+						this.close();
+						this.onSave(null);
+					}),
+			);
+		buttons.addButton((btn) =>
+			btn.setButtonText('Cancel').onClick(() => this.close()),
+		);
+	}
+
+	private save(): void {
+		// [[Note]] works too.
+		const target = this.target.trim().replace(/^\[\[(.*)\]\]$/, '$1');
+		this.close();
+		if (!target) {
+			if (this.hasLink) this.onSave(null);
+			return;
+		}
+		this.onSave({ text: this.text.trim() || target, target });
 	}
 
 	onClose(): void {

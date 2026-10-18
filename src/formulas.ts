@@ -301,8 +301,69 @@ function isTrue(v: unknown): boolean {
 	throw LibFormulaError.VALUE;
 }
 
+/** Which AI a CLAUDE() or GEMINI() formula asks. */
+export type AiFormulaProvider = 'claude' | 'gemini';
+
+/**
+ * Answers an AI formula: the cached answer, or a placeholder while the request runs. Set by
+ * the view, which owns the requests and the cache; without it the functions are unknown.
+ */
+export type AiFormulaHandler = (
+	provider: AiFormulaProvider,
+	prompt: string,
+	context: string,
+) => Scalar;
+
+let aiFormulaHandler: AiFormulaHandler | null = null;
+
+/** Sets the handler for the formulas evaluated next; returns the one it replaces, to put back. */
+export function setAiFormulaHandler(
+	handler: AiFormulaHandler | null,
+): AiFormulaHandler | null {
+	const previous = aiFormulaHandler;
+	aiFormulaHandler = handler;
+	return previous;
+}
+
+/** An argument as text for an AI prompt: a range becomes tab-separated rows. */
+function argAsPromptText(arg: Arg | undefined): string {
+	const cell = (v: unknown): string => {
+		if (isBlank(v)) return '';
+		if (v instanceof LibFormulaError) {
+			const error = (v as { error?: unknown }).error;
+			return typeof error === 'string' ? error : '#VALUE!';
+		}
+		if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+		return String(v);
+	};
+	const v = arg?.value;
+	if (!Array.isArray(v)) return cell(v);
+	return v
+		.map((row: unknown) =>
+			Array.isArray(row) ? row.map(cell).join('\t') : cell(row),
+		)
+		.join('\n');
+}
+
+function aiFormula(
+	provider: AiFormulaProvider,
+	args: (Arg | undefined)[],
+): unknown {
+	if (!aiFormulaHandler) throw new LibFormulaError('#NAME?');
+	const prompt = argAsPromptText(args[0]).trim();
+	if (!prompt) throw LibFormulaError.VALUE;
+	const context = args
+		.slice(1)
+		.map(argAsPromptText)
+		.filter((t) => t !== '')
+		.join('\n\n');
+	return aiFormulaHandler(provider, prompt, context);
+}
+
 /** Functions the library lacks, or gets wrong for empty cells. */
 const EXTRA_FUNCTIONS: Record<string, LibFunction> = {
+	CLAUDE: (...args) => aiFormula('claude', args),
+	GEMINI: (...args) => aiFormula('gemini', args),
 	// The library's SUM skips an error in a cell instead of showing it.
 	SUM: (...args) => argNumbers(args).reduce((a, b) => a + b, 0),
 	// Excel gives 0 (the library gave 1) when there is no number to multiply.
@@ -1095,6 +1156,16 @@ export const FORMULA_FUNCTIONS: FormulaFunctionInfo[] = [
 	fn('ROW', 'ROW([reference])', 'Row number of a reference'),
 	fn('COLUMN', 'COLUMN([reference])', 'Column number of a reference'),
 	fn('PMT', 'PMT(rate, periods, present_value)', 'Loan payment per period'),
+	fn(
+		'CLAUDE',
+		'CLAUDE(prompt, [cells], …)',
+		'Asks Claude; the answer goes in the cell (needs an API key)',
+	),
+	fn(
+		'GEMINI',
+		'GEMINI(prompt, [cells], …)',
+		'Asks Gemini; the answer goes in the cell (needs an API key)',
+	),
 ];
 
 /* ------------------------------------------------------------------ */
@@ -1195,6 +1266,8 @@ function sampleFor(param: string, nextCell: () => string): string {
 	if (p === 'rate') return '0.05';
 	if (p === 'periods') return '12';
 	if (p === 'present_value') return '1000';
+	if (p === 'prompt') return '"Summarize"';
+	if (p === 'cells') return 'A1';
 	return nextCell();
 }
 

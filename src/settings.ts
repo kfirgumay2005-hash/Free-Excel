@@ -1,9 +1,11 @@
 import {
 	App,
 	PluginSettingTab,
+	Setting,
 	SettingDefinitionItem,
 	SliderComponent,
 } from 'obsidian';
+import { AiProvider, aiKeySecretId } from './ai';
 import type RtlSpreadsheetPlugin from './main';
 
 /** Opens Settings > Hotkeys filtered to this plugin's commands (internal API, so every step is optional). */
@@ -45,7 +47,25 @@ export interface PluginSettings {
 	savedTextColors: string[];
 	/** Ctrl+G (Cmd+G) opens the find bar of the active sheet instead of Obsidian's graph view. */
 	ctrlGFind: boolean;
+	/** Show a cell's comment and link when the mouse is over it (off: only when the cell is selected). */
+	commentsOnHover: boolean;
+	/** Names of the API keys in Obsidian's secret storage (the keys themselves are not saved here). */
+	claudeKeySecret: string;
+	geminiKeySecret: string;
+	claudeModel: string;
+	geminiModel: string;
+	/** Gemini model that makes pictures for the assistant's generate_image tool. */
+	geminiImageModel: string;
+	/** The provider the assistant panel starts with. */
+	aiProvider: 'claude' | 'gemini';
+	/** Recently inserted emojis, newest first (managed by the emoji picker). */
+	recentEmojis: string[];
 }
+
+export const DEFAULT_CLAUDE_MODEL = 'claude-opus-5-5';
+export const DEFAULT_GEMINI_MODEL = 'gemini-flash-latest';
+export const DEFAULT_GEMINI_IMAGE_MODEL = 'gemini-2.5-flash-image';
+export const MAX_RECENT_EMOJIS = 24;
 
 /** How many colors can be saved for the fill, and how many for the text. */
 export const MAX_SAVED_COLORS = 10;
@@ -66,6 +86,14 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	savedFillColors: [],
 	savedTextColors: [],
 	ctrlGFind: false,
+	commentsOnHover: false,
+	claudeKeySecret: '',
+	geminiKeySecret: '',
+	claudeModel: DEFAULT_CLAUDE_MODEL,
+	geminiModel: DEFAULT_GEMINI_MODEL,
+	geminiImageModel: DEFAULT_GEMINI_IMAGE_MODEL,
+	aiProvider: 'claude',
+	recentEmojis: [],
 };
 
 function toColors(value: unknown): string[] {
@@ -75,6 +103,13 @@ function toColors(value: unknown): string[] {
 		.map((v) => v.toLowerCase())
 		.filter((v) => /^#[0-9a-f]{6}$/.test(v));
 	return [...new Set(colors)].slice(0, MAX_SAVED_COLORS);
+}
+
+/** Trimmed text, or the fallback when it is empty or not text. */
+function toText(value: unknown, fallback: string): string {
+	return typeof value === 'string' && value.trim() !== ''
+		? value.trim()
+		: fallback;
 }
 
 function toInt(
@@ -149,6 +184,18 @@ export function sanitizeSettings(
 		savedFillColors: toColors(s.savedFillColors),
 		savedTextColors: toColors(s.savedTextColors),
 		ctrlGFind: !!s.ctrlGFind,
+		commentsOnHover: !!s.commentsOnHover,
+		claudeKeySecret: toText(s.claudeKeySecret, ''),
+		geminiKeySecret: toText(s.geminiKeySecret, ''),
+		claudeModel: toText(s.claudeModel, DEFAULT_CLAUDE_MODEL),
+		geminiModel: toText(s.geminiModel, DEFAULT_GEMINI_MODEL),
+		geminiImageModel: toText(s.geminiImageModel, DEFAULT_GEMINI_IMAGE_MODEL),
+		aiProvider: s.aiProvider === 'gemini' ? 'gemini' : 'claude',
+		recentEmojis: Array.isArray(s.recentEmojis)
+			? s.recentEmojis
+					.filter((v): v is string => typeof v === 'string')
+					.slice(0, MAX_RECENT_EMOJIS)
+			: [],
 	};
 }
 
@@ -169,6 +216,70 @@ export class SettingsTab extends PluginSettingTab {
 		Object.assign(this.plugin.settings, { [key]: value });
 		await this.plugin.saveSettings();
 		this.refreshDomState();
+	}
+
+	/**
+	 * One field to paste the key into, and the steps to get one. The key goes straight to
+	 * Obsidian's secret storage; it is never written to the plugin settings.
+	 */
+	private renderKeyField(setting: Setting, provider: AiProvider): void {
+		const id = aiKeySecretId(provider);
+		const steps =
+			provider === 'claude'
+				? {
+						url: 'https://console.anthropic.com/settings/keys',
+						site: 'console.anthropic.com',
+						list: [
+							'Open the Anthropic Console and sign in (or create an account).',
+							'Under Settings > Billing, add credits: the API is paid separately from a Claude.ai subscription.',
+							'Under Settings > API keys, choose "Create key", give it a name and copy it (it starts with "sk-ant-").',
+							'Paste the key here.',
+						],
+					}
+				: {
+						url: 'https://aistudio.google.com/apikey',
+						site: 'aistudio.google.com/apikey',
+						list: [
+							'Open Google AI Studio and sign in with your Google account.',
+							'Choose "Create API key" (pick or create a Google Cloud project when asked).',
+							'Open the key and copy the long line under "API key". There is a free tier with daily limits.',
+							'Paste the key here.',
+						],
+					};
+		setting.descEl.empty();
+		setting.descEl.createDiv({
+			text: `Used by the assistant panel and the ${provider === 'claude' ? 'CLAUDE()' : 'GEMINI()'} formula. How to get a key:`,
+		});
+		const ol = setting.descEl.createEl('ol', { cls: 'rtl-sheet-key-steps' });
+		steps.list.forEach((step, i) => {
+			const li = ol.createEl('li', { text: step });
+			if (i === 0) {
+				li.appendText(' ');
+				li.createEl('a', { text: steps.site, href: steps.url });
+			}
+		});
+		setting.descEl.createDiv({
+			text: 'The key is kept in the Obsidian secret storage on this device, not in the plugin settings or the vault.',
+		});
+
+		let stored = '';
+		try {
+			stored = this.app.secretStorage.getSecret(id) ?? '';
+		} catch {
+			stored = '';
+		}
+		setting.addText((text) => {
+			text.inputEl.type = 'password';
+			text.inputEl.autocomplete = 'off';
+			text.inputEl.spellcheck = false;
+			text.setPlaceholder('Paste the API key').setValue(stored).onChange((value) => {
+				try {
+					this.app.secretStorage.setSecret(id, value.trim());
+				} catch (e) {
+					console.error('[Free-Excel] Could not store the API key', e);
+				}
+			});
+		});
 	}
 
 	getSettingDefinitions(): SettingDefinitionItem<keyof PluginSettings>[] {
@@ -269,6 +380,11 @@ export class SettingsTab extends PluginSettingTab {
 						desc: 'Evaluate cells that start with "=" (SUM, AVERAGE, COUNT, MIN, MAX, IF and many more). Applies to all open sheets immediately.',
 						control: { type: 'toggle', key: 'enableFormulas' },
 					},
+					{
+						name: 'Show comments on hover',
+						desc: 'Show the comment and link of a cell as soon as the mouse is over it. When off, they show only when you click the cell.',
+						control: { type: 'toggle', key: 'commentsOnHover' },
+					},
 				],
 			},
 			{
@@ -289,6 +405,58 @@ export class SettingsTab extends PluginSettingTab {
 									.setButtonText('Open hotkeys')
 									.onClick(() => openHotkeySettings(this.app)),
 							);
+						},
+					},
+				],
+			},
+			{
+				type: 'group',
+				heading: 'AI (Claude and Gemini)',
+				items: [
+					{
+						name: 'Claude API key',
+						desc: 'Used by the assistant panel and the CLAUDE() formula.',
+						render: (setting) => this.renderKeyField(setting, 'claude'),
+					},
+					{
+						name: 'Claude model',
+						desc: `Model ID, for example ${DEFAULT_CLAUDE_MODEL} or claude-haiku-5-5 (faster and cheaper for many formulas).`,
+						control: {
+							type: 'text',
+							key: 'claudeModel',
+							placeholder: DEFAULT_CLAUDE_MODEL,
+						},
+					},
+					{
+						name: 'Gemini API key',
+						desc: 'Used by the assistant panel and the GEMINI() formula.',
+						render: (setting) => this.renderKeyField(setting, 'gemini'),
+					},
+					{
+						name: 'Gemini model',
+						desc: `Model ID, for example ${DEFAULT_GEMINI_MODEL} or gemini-3.1-pro-preview.`,
+						control: {
+							type: 'text',
+							key: 'geminiModel',
+							placeholder: DEFAULT_GEMINI_MODEL,
+						},
+					},
+					{
+						name: 'Gemini image model',
+						desc: 'Makes pictures when you ask the assistant (with Claude or Gemini) to create an image. Needs the Gemini API key; image models may need a paid plan.',
+						control: {
+							type: 'text',
+							key: 'geminiImageModel',
+							placeholder: DEFAULT_GEMINI_IMAGE_MODEL,
+						},
+					},
+					{
+						name: 'Assistant provider',
+						desc: 'Which AI the assistant panel uses when it opens. You can switch in the panel.',
+						control: {
+							type: 'dropdown',
+							key: 'aiProvider',
+							options: { claude: 'Claude', gemini: 'Gemini' },
 						},
 					},
 				],

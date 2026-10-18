@@ -832,3 +832,468 @@
 .is-mobile .rtl-sheet-ac-item {
 	padding: 10px 12px;
 }
+
+/* ---------- Check boxes, links and comments in cells ---------- */
+
+/* The popup with a cell's comment is placed relative to the view. */
+.view-content.rtl-spreadsheet-view {
+	position: relative;
+}
+
+.rtl-sheet-grid td.rtl-sheet-checkbox-cell {
+	cursor: default;
+}
+
+.rtl-sheet-grid .rtl-sheet-checkbox {
+	width: var(--rtl-sheet-checkbox-size, 16px);
+	height: var(--rtl-sheet-checkbox-size, 16px);
+	margin: 0;
+	vertical-align: middle;
+	cursor: pointer;
+}
+
+.rtl-sheet-grid .rtl-sheet-link {
+	color: var(--link-external-color, var(--text-accent));
+	text-decoration: underline;
+	text-decoration-color: color-mix(in srgb, currentColor 50%, transparent);
+}
+
+/* A comment marks the top right corner of its cell (like Excel). */
+.rtl-sheet-grid td.rtl-sheet-has-comment {
+	position: relative;
+}
+
+.rtl-sheet-grid td.rtl-sheet-has-comment::after {
+	content: '';
+	position: absolute;
+	top: 0;
+	right: 0;
+	width: 0;
+	height: 0;
+	border-style: solid;
+	border-width: 0 8px 8px 0;
+	border-color: transparent var(--rtl-sheet-comment-color, #f2a900) transparent
+		transparent;
+	pointer-events: none;
+}
+
+.rtl-sheet-cell-info {
+	position: absolute;
+	z-index: 30;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	width: max-content;
+	max-width: min(280px, 80%);
+	padding: 8px 10px;
+	direction: ltr;
+	font-size: var(--font-ui-small);
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	box-shadow: var(--shadow-s);
+}
+
+.rtl-sheet-cell-info.is-offscreen {
+	visibility: hidden;
+}
+
+.rtl-sheet-info-comment {
+	padding-inline-start: 8px;
+	border-inline-start: 3px solid var(--rtl-sheet-comment-color, #f2a900);
+}
+
+.rtl-sheet-info-text {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	max-height: 200px;
+	overflow-y: auto;
+}
+
+.rtl-sheet-info-foot,
+.rtl-sheet-info-link,
+.rtl-sheet-comment-item-head {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.rtl-sheet-info-foot {
+	margin-top: 4px;
+}
+
+.rtl-sheet-info-time {
+	flex: 1 1 auto;
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller);
+}
+
+.rtl-sheet-info-link a {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.rtl-sheet-info-icon {
+	display: flex;
+	color: var(--text-muted);
+	--icon-size: 14px;
+}
+
+.rtl-sheet-info-btn,
+.rtl-sheet-side-btn {
+	flex: 0 0 auto;
+	padding: 2px 6px;
+	height: auto;
+	box-shadow: none;
+	background: transparent;
+	cursor: pointer;
+	--icon-size: 14px;
+}
+
+.rtl-sheet-info-btn:hover,
+.rtl-sheet-side-btn:hover {
+	background: var(--background-modifier-hover);
+}
+
+/* ---------- Floating images ---------- */
+
+.rtl-sheet-float-img {
+	position: absolute;
+	pointer-events: auto;
+	cursor: move;
+	touch-action: none;
+	user-select: none;
+	outline: 1px solid transparent;
+}
+
+.rtl-sheet-float-img img {
+	display: block;
+	width: 100%;
+	height: 100%;
+	object-fit: fill;
+	pointer-events: none;
+}
+
+.rtl-sheet-float-img:hover,
+.rtl-sheet-float-img.is-active {
+	outline-color: var(--interactive-accent);
+}
+
+.rtl-sheet-float-missing {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 100%;
+	height: 100%;
+	color: var(--text-muted);
+	background: var(--background-secondary);
+}
+
+.rtl-sheet-float-btn {
+	position: absolute;
+	top: 4px;
+	right: 4px;
+	padding: 4px;
+	height: auto;
+	opacity: 0;
+	background: var(--background-primary);
+	box-shadow: var(--shadow-s);
+	--icon-size: 14px;
+}
+
+.rtl-sheet-float-img .rtl-sheet-chart-grip {
+	opacity: 0;
+	background-color: var(--background-primary);
+}
+
+.rtl-sheet-float-img:hover .rtl-sheet-float-btn,
+.rtl-sheet-float-img.is-active .rtl-sheet-float-btn,
+.rtl-sheet-float-img:hover .rtl-sheet-chart-grip,
+.rtl-sheet-float-img.is-active .rtl-sheet-chart-grip {
+	opacity: 1;
+}
+
+/* ---------- Side panel: comments and the AI assistant ---------- */
+
+.rtl-spreadsheet-view .rtl-sheet-side-panel {
+	display: flex;
+	flex-direction: column;
+	flex: 0 0 320px;
+	min-height: 0;
+	direction: ltr;
+	border-inline-start: 1px solid var(--background-modifier-border);
+	background: var(--background-primary);
+}
+
+.rtl-sheet-comments-panel,
+.rtl-sheet-ai-host,
+.rtl-sheet-ai-panel {
+	display: flex;
+	flex-direction: column;
+	flex: 1 1 auto;
+	min-height: 0;
+}
+
+@container (max-width: 640px) {
+	.rtl-spreadsheet-view .rtl-sheet-side-panel {
+		flex: 0 0 auto;
+		height: 50%;
+		border-inline-start: none;
+		border-top: 1px solid var(--background-modifier-border);
+	}
+}
+
+.rtl-sheet-side-head {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 8px 8px 8px 12px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.rtl-sheet-side-title {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex: 1 1 auto;
+	min-width: 0;
+	font-weight: var(--font-semibold);
+	--icon-size: 16px;
+}
+
+.rtl-sheet-side-title span {
+	display: flex;
+}
+
+.rtl-sheet-side-empty,
+.rtl-sheet-ai-hint {
+	padding: 12px;
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+}
+
+.rtl-sheet-ai-hint p {
+	margin: 0 0 8px;
+}
+
+.rtl-sheet-ai-warning {
+	color: var(--text-warning);
+}
+
+.rtl-sheet-comment-list,
+.rtl-sheet-ai-list {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+	-webkit-overflow-scrolling: touch;
+}
+
+.rtl-sheet-comment-item {
+	margin: 8px;
+	padding: 6px 8px;
+	border: 1px solid var(--background-modifier-border);
+	border-inline-start: 4px solid var(--rtl-sheet-comment-color, #f2a900);
+	border-radius: var(--radius-s);
+	font-size: var(--font-ui-small);
+	cursor: pointer;
+}
+
+.rtl-sheet-comment-item:hover {
+	background: var(--background-modifier-hover);
+}
+
+.rtl-sheet-comment-cell {
+	font-family: var(--font-monospace);
+	font-weight: var(--font-semibold);
+}
+
+.rtl-sheet-ai-provider {
+	max-width: 110px;
+}
+
+.rtl-sheet-ai-msg {
+	margin: 8px;
+	padding: 6px 10px;
+	border-radius: var(--radius-m);
+	font-size: var(--font-ui-small);
+	overflow-wrap: anywhere;
+	user-select: text;
+}
+
+.rtl-sheet-ai-msg.is-user {
+	margin-inline-start: 32px;
+	white-space: pre-wrap;
+	background: var(--background-modifier-hover);
+}
+
+.rtl-sheet-ai-msg.is-assistant > :first-child {
+	margin-top: 0;
+}
+
+.rtl-sheet-ai-msg.is-assistant > :last-child {
+	margin-bottom: 0;
+}
+
+.rtl-sheet-ai-msg.is-action {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-block: 2px;
+	padding-block: 2px;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+	--icon-size: 12px;
+}
+
+.rtl-sheet-ai-msg.is-action span {
+	display: flex;
+}
+
+.rtl-sheet-ai-msg.is-error {
+	color: var(--text-error);
+	background: rgba(var(--color-red-rgb), 0.08);
+}
+
+.rtl-sheet-ai-msg.is-busy {
+	color: var(--text-faint);
+	font-style: italic;
+}
+
+.rtl-sheet-ai-form {
+	display: flex;
+	align-items: flex-end;
+	gap: 6px;
+	padding: 8px;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.rtl-sheet-ai-input {
+	flex: 1 1 auto;
+	min-width: 0;
+	resize: vertical;
+	max-height: 200px;
+}
+
+.rtl-sheet-ai-form .rtl-sheet-side-btn.mod-cta {
+	padding: 8px 10px;
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+	--icon-size: 16px;
+}
+
+.rtl-spreadsheet-view.is-touch .rtl-sheet-ai-input {
+	font-size: 16px;
+}
+
+/* ---------- Emoji picker (attached to <body>) ---------- */
+
+.rtl-sheet-emoji-picker {
+	position: fixed;
+	z-index: var(--layer-popover, 100);
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 8px;
+	direction: ltr;
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	box-shadow: var(--shadow-l);
+}
+
+.rtl-sheet-emoji-search {
+	width: 100%;
+}
+
+.is-mobile .rtl-sheet-emoji-search {
+	font-size: 16px;
+}
+
+.rtl-sheet-emoji-tabs {
+	display: flex;
+	gap: 2px;
+	overflow-x: auto;
+}
+
+.rtl-sheet-emoji-tab {
+	flex: 0 0 auto;
+	padding: 4px 6px;
+	height: auto;
+	box-shadow: none;
+	background: transparent;
+	--icon-size: 16px;
+}
+
+.rtl-sheet-emoji-tab.is-active {
+	background: var(--background-modifier-active-hover);
+	color: var(--text-accent);
+}
+
+.rtl-sheet-emoji-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(36px, 1fr));
+	gap: 2px;
+	height: 240px;
+	overflow-y: auto;
+	align-content: start;
+	-webkit-overflow-scrolling: touch;
+}
+
+.rtl-sheet-emoji {
+	padding: 0;
+	height: 36px;
+	font-size: 22px;
+	line-height: 1;
+	box-shadow: none;
+	background: transparent;
+}
+
+.rtl-sheet-emoji:hover {
+	background: var(--background-modifier-hover);
+}
+
+.rtl-sheet-emoji-empty {
+	grid-column: 1 / -1;
+	padding: 12px;
+	color: var(--text-muted);
+	text-align: center;
+}
+
+/* ---------- Comment dialog ---------- */
+
+.rtl-sheet-comment-input {
+	width: 100%;
+	min-height: 100px;
+	resize: vertical;
+}
+
+.rtl-sheet-comment-colors {
+	display: flex;
+	gap: 4px;
+}
+
+.rtl-sheet-comment-colors .rtl-sheet-swatch {
+	width: 22px;
+	height: 22px;
+	padding: 0;
+	border: 1px solid var(--background-modifier-border-hover);
+	border-radius: 50%;
+	box-shadow: none;
+	background: var(--rtl-sheet-swatch);
+	cursor: pointer;
+}
+
+.rtl-sheet-comment-colors .rtl-sheet-swatch.is-active {
+	outline: 2px solid var(--text-normal);
+	outline-offset: 1px;
+}
+
+/* ---------- Settings: steps to get an API key ---------- */
+
+.rtl-sheet-key-steps {
+	margin: 4px 0;
+	padding-inline-start: 20px;
+}

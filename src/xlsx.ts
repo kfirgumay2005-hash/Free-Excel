@@ -8,6 +8,10 @@ export interface ImportedSheet {
 	/** The values the file stored for its formula cells, keyed "row,col" (empty when it stores none, like CSV). */
 	results: Record<string, Scalar>;
 	formats: Record<string, CellFormat>;
+	/** Cell notes, keyed "row,col". */
+	comments: Record<string, string>;
+	/** Cell hyperlinks, keyed "row,col". */
+	links: Record<string, string>;
 	merges: MergeInfo[];
 	colWidths: (number | null)[];
 	rowHeights: (number | null)[];
@@ -261,6 +265,8 @@ export function parseCsv(text: string): ImportedSheet {
 		data,
 		results: {},
 		formats: {},
+		comments: {},
+		links: {},
 		merges: [],
 		colWidths: [],
 		rowHeights: [],
@@ -363,6 +369,17 @@ function cellValueToScalar(cell: ExcelJS.Cell): Scalar {
 	return null;
 }
 
+/** The text of a cell note (plain or rich text). */
+function noteText(note: unknown): string {
+	if (typeof note === 'string') return note.trim();
+	const texts = (note as { texts?: { text?: unknown }[] } | null)?.texts;
+	if (!Array.isArray(texts)) return '';
+	return texts
+		.map((t) => (typeof t.text === 'string' ? t.text : ''))
+		.join('')
+		.trim();
+}
+
 function rotationFromExcel(
 	value: number | string | undefined,
 ): number | undefined {
@@ -455,6 +472,8 @@ export async function parseXlsx(buffer: ArrayBuffer): Promise<ImportedSheet> {
 	);
 	const formats: Record<string, CellFormat> = {};
 	const results: Record<string, Scalar> = {};
+	const comments: Record<string, string> = {};
+	const links: Record<string, string> = {};
 
 	ws.eachRow({ includeEmpty: true }, (row, rowNumber) => {
 		const r = rowNumber - 1;
@@ -472,6 +491,12 @@ export async function parseXlsx(buffer: ArrayBuffer): Promise<ImportedSheet> {
 			}
 			const f = extractFormat(cell);
 			if (f) formats[key(r, c)] = f;
+			const note = noteText(cell.note);
+			if (note) comments[key(r, c)] = note;
+			const link = (cell.value as { hyperlink?: unknown } | null)?.hyperlink;
+			// Links inside the workbook ("#Sheet2!A1") have no place to go here.
+			if (typeof link === 'string' && link && !link.startsWith('#'))
+				links[key(r, c)] = link;
 		});
 	});
 
@@ -515,5 +540,15 @@ export async function parseXlsx(buffer: ArrayBuffer): Promise<ImportedSheet> {
 		.views?.[0];
 	const rtl = view?.rightToLeft === true || detectRtl(data);
 
-	return { data, results, formats, merges, colWidths, rowHeights, rtl };
+	return {
+		data,
+		results,
+		formats,
+		comments,
+		links,
+		merges,
+		colWidths,
+		rowHeights,
+		rtl,
+	};
 }

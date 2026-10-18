@@ -41,6 +41,31 @@ export interface CellFormat {
 	bgColor?: string;
 	textColor?: string;
 	borders?: CellBorders;
+	/** The cell shows a check box; its value is TRUE (checked) or FALSE. */
+	checkbox?: boolean;
+}
+
+/** A note on a cell, marked by a colored corner and shown next to the cell. */
+export interface CellComment {
+	text: string;
+	/** Color of the corner mark, "#rrggbb". */
+	color: string;
+	/** When it was written or last changed (ms since 1970). */
+	time: number;
+}
+
+export const DEFAULT_COMMENT_COLOR = '#f2a900';
+
+/** An image that floats over the grid, like a chart, instead of living in a cell. */
+export interface FloatingImage {
+	id: string;
+	/** Vault path of the image. */
+	path: string;
+	/** Position and size in px at 100% zoom, measured from the top-left corner of cell A1. */
+	x: number;
+	y: number;
+	w: number;
+	h: number;
 }
 
 /** Remembers a cell's size from before an image resized it, so deleting the image can restore it. */
@@ -132,6 +157,10 @@ export interface SheetModel {
 	/** "row,col" -> vault path of an image shown inside the cell. */
 	images: Record<string, string>;
 	imageSizes: Record<string, ImageSizeRecord>;
+	/** "row,col" -> comment. Replaced, never changed in place (undo compares them). */
+	comments: Record<string, CellComment>;
+	/** "row,col" -> link target: a web address or the name of a note in the vault. */
+	links: Record<string, string>;
 	/** column index -> width the column had before "widen column" changed it. */
 	widenRecords?: Record<string, { prevW: number | null; w: number }>;
 	merges: MergeInfo[];
@@ -139,6 +168,7 @@ export interface SheetModel {
 	rowHeights: (number | null)[];
 	rtl: boolean;
 	charts: ChartSpec[];
+	floatingImages: FloatingImage[];
 }
 
 /** A file holds one or more sheets (tabs). */
@@ -146,6 +176,11 @@ export interface WorkbookModel {
 	sheets: SheetModel[];
 	/** Index of the sheet that was shown when the file was saved. */
 	active: number;
+	/**
+	 * Answers of CLAUDE() and GEMINI() formulas by request, so opening the file again does
+	 * not ask (and pay) again. Not part of the undo history.
+	 */
+	aiResults?: Record<string, string>;
 }
 
 /** File format version that stores several sheets. Older files hold one sheet at the top level. */
@@ -219,11 +254,14 @@ export function createDefaultModel(
 		cellFormats: {},
 		images: {},
 		imageSizes: {},
+		comments: {},
+		links: {},
 		merges: [],
 		colWidths: [],
 		rowHeights: [],
 		rtl,
 		charts: [],
+		floatingImages: [],
 	};
 }
 
@@ -232,6 +270,7 @@ export function serializeWorkbook(wb: WorkbookModel): string {
 		version: WORKBOOK_VERSION,
 		active: wb.active,
 		sheets: wb.sheets,
+		aiResults: wb.aiResults ?? {},
 	});
 }
 
@@ -263,6 +302,38 @@ export function sheetRefName(name: string): string {
 		: `'${name}'`;
 }
 
+/** "B3" -> { row: 2, col: 1 }; null when the text is not a cell reference. */
+export function parseCellRef(ref: string): { row: number; col: number } | null {
+	const m = /^\$?([A-Za-z]{1,3})\$?(\d+)$/.exec(ref.trim());
+	if (!m) return null;
+	let col = 0;
+	for (const ch of (m[1] ?? '').toUpperCase())
+		col = col * 26 + (ch.charCodeAt(0) - 64);
+	const row = parseInt(m[2] ?? '0', 10) - 1;
+	return row < 0 ? null : { row, col: col - 1 };
+}
+
+/** "A1:C5" or "B2" (an optional "Sheet!" in front is left out) -> a normalized range. */
+export function parseRangeRef(ref: string): SelRange | null {
+	const bare = ref.includes('!') ? ref.slice(ref.lastIndexOf('!') + 1) : ref;
+	const [a = '', b] = bare.split(':');
+	const from = parseCellRef(a);
+	const to = b === undefined ? from : parseCellRef(b);
+	if (!from || !to) return null;
+	return {
+		r1: Math.min(from.row, to.row),
+		c1: Math.min(from.col, to.col),
+		r2: Math.max(from.row, to.row),
+		c2: Math.max(from.col, to.col),
+	};
+}
+
+export function rangeLabel(rg: SelRange): string {
+	const first = `${indexToColumnLabel(rg.c1)}${rg.r1 + 1}`;
+	const last = `${indexToColumnLabel(rg.c2)}${rg.r2 + 1}`;
+	return first === last ? first : `${first}:${last}`;
+}
+
 export function isEmptyFormat(f: CellFormat): boolean {
 	if (
 		f.bold ||
@@ -275,7 +346,8 @@ export function isEmptyFormat(f: CellFormat): boolean {
 		f.rotate ||
 		f.fontSize ||
 		f.bgColor ||
-		f.textColor
+		f.textColor ||
+		f.checkbox
 	) {
 		return false;
 	}
