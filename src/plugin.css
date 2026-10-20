@@ -131,6 +131,26 @@
 	overscroll-behavior: contain;
 }
 
+/*
+ * Row heights are a whole text line (rounded up) plus ROW_VERTICAL_PADDING, but a cell also draws
+ * its 1px bottom border (and the first row its top border), so it came out a fraction of a pixel
+ * taller than Handsontable's row height. The row headers and the selection border follow that row
+ * height, so they drifted off the cells further down the sheet. One pixel less padding keeps every
+ * cell within the row height.
+ */
+.rtl-sheet-grid .ht_master .htCore > tbody > tr > td {
+	padding-bottom: calc(var(--ht-cell-vertical-padding) - 1px);
+}
+
+.rtl-sheet-grid .ht_master .htCore > tbody > tr:first-child > td {
+	padding-top: calc(var(--ht-cell-vertical-padding) - 1px);
+}
+
+/* Resolves var(--…) colors for the border corner images (see applyBorderStyles). */
+.rtl-sheet-color-probe {
+	display: none;
+}
+
 /* ---------- Sheet tabs ---------- */
 
 .rtl-spreadsheet-view .rtl-sheet-tabs {
@@ -138,14 +158,15 @@
 	align-items: stretch;
 	gap: 4px;
 	flex: 0 0 auto;
-	padding: 2px 8px;
+	/* No top padding: the active tab's accent line meets the border above it. */
+	padding: 0 8px 2px;
 	border-top: 1px solid var(--background-modifier-border);
 	background: var(--background-secondary);
 }
 
 .rtl-spreadsheet-view .rtl-sheet-tab-list {
 	display: flex;
-	gap: 2px;
+	gap: 0;
 	min-width: 0;
 	overflow-x: auto;
 	scrollbar-width: thin;

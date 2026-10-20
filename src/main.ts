@@ -191,37 +191,114 @@ function sanitizeSheetName(name: string): string {
 	return (cleaned || 'Sheet1').slice(0, 31);
 }
 
-/** Draws cell borders as background layers (reliable inside Handsontable's table cells). */
-function applyBorderStyles(st: CSSStyleDeclaration, b?: CellBorders): void {
-	const color = b?.color ?? 'var(--text-normal)';
-	const layer = `linear-gradient(${color}, ${color})`;
-	const images: string[] = [];
-	const sizes: string[] = [];
-	const positions: string[] = [];
-	if (b?.top) {
-		images.push(layer);
-		sizes.push('100% 1px');
-		positions.push('0 0');
-	}
-	if (b?.right) {
-		images.push(layer);
-		sizes.push('1px 100%');
-		positions.push('100% 0');
-	}
-	if (b?.bottom) {
-		images.push(layer);
-		sizes.push('100% 1px');
-		positions.push('0 100%');
-	}
-	if (b?.left) {
-		images.push(layer);
-		sizes.push('1px 100%');
-		positions.push('0 0');
-	}
-	st.backgroundImage = images.join(', ');
-	st.backgroundSize = sizes.join(', ');
-	st.backgroundPosition = positions.join(', ');
-	st.backgroundRepeat = images.length > 0 ? 'no-repeat' : '';
+type BorderSide = 'top' | 'right' | 'bottom' | 'left';
+
+/** The color of one side of a cell's borders, or null when that side has no border. */
+function borderColor(b: CellBorders | undefined, side: BorderSide): string | null {
+	return b?.[side] ? (b.color ?? 'var(--text-normal)') : null;
+}
+
+/** Turns a var(--…) color into rgb(), which the border corner image needs. */
+function resolveColor(doc: Document, value: string): string {
+	if (!value.includes('var(')) return value;
+	const probe =
+		doc.body.querySelector<HTMLElement>(':scope > .rtl-sheet-color-probe') ??
+		doc.body.createSpan({ cls: 'rtl-sheet-color-probe' });
+	probe.style.color = value;
+	return doc.defaultView?.getComputedStyle(probe).color ?? value;
+}
+
+/**
+ * Draws a cell's borders on the grid lines themselves, like Excel. Every cell owns its bottom
+ * and inline-end grid line (the cell's own borders), so a border between two cells is one line,
+ * whichever cell it was set on, and a filled cell takes over the grid lines next to it. The
+ * first row also owns the line under the column headers and the first column the line next to
+ * the row headers (they come from the cells' top and inline-start borders).
+ */
+function applyBorderStyles(
+	td: HTMLTableCellElement,
+	formats: Record<string, CellFormat>,
+	row: number,
+	col: number,
+	rtl: boolean,
+): void {
+	const st = td.style;
+	const bordersAt = (r: number, c: number): CellBorders | undefined =>
+		formats[key(r, c)]?.borders;
+	const start: BorderSide = rtl ? 'right' : 'left';
+	const end: BorderSide = rtl ? 'left' : 'right';
+	// The grid line under cell (r, c) and the one at its inline end, shared with the neighbors.
+	const lineBelow = (r: number, c: number): string | null =>
+		borderColor(bordersAt(r, c), 'bottom') ?? borderColor(bordersAt(r + 1, c), 'top');
+	const lineAtEnd = (r: number, c: number): string | null =>
+		borderColor(bordersAt(r, c), end) ?? borderColor(bordersAt(r, c + 1), start);
+
+	const own = bordersAt(row, col);
+	const fill = formats[key(row, col)]?.bgColor;
+	const bottom = lineBelow(row, col);
+	const atEnd = lineAtEnd(row, col);
+	const top = row === 0 ? borderColor(own, 'top') : null;
+	const atStart = col === 0 ? borderColor(own, start) : null;
+	st.borderBottomColor = bottom ?? fill ?? formats[key(row + 1, col)]?.bgColor ?? '';
+	// Spilled text has made the inline-end line transparent; a border still shows over it.
+	if (atEnd) st.borderInlineEndColor = atEnd;
+	else if (st.borderInlineEndColor !== 'transparent')
+		st.borderInlineEndColor = fill ?? formats[key(row, col + 1)]?.bgColor ?? '';
+	st.borderTopColor = top ?? '';
+	st.borderInlineStartColor = atStart ?? '';
+	st.borderImage = '';
+
+	// The browser splits a corner pixel between the cell's two sides: when they differ in color
+	// the corner is a blend, and a border that only the neighbors draw never reaches it. When a
+	// border meets a corner the sides cannot paint whole, draw the frame as a 3×3 image instead.
+	const first = (...colors: (string | null)[]): string | null =>
+		colors.find((c): c is string => c !== null) ?? null;
+	const corners = {
+		bottomEnd: first(bottom, atEnd, lineBelow(row, col + 1), lineAtEnd(row + 1, col)),
+		topEnd: row === 0 ? first(top, atEnd, borderColor(bordersAt(0, col + 1), 'top')) : null,
+		bottomStart: col === 0 ? first(atStart, bottom, borderColor(bordersAt(row + 1, 0), start)) : null,
+		topStart: row === 0 && col === 0 ? first(top, atStart) : null,
+	};
+	const whole = (want: string | null, a: string | null, b: string | null): boolean =>
+		want === null || (a === want && b === want);
+	if (
+		whole(corners.bottomEnd, bottom, atEnd) &&
+		whole(corners.topEnd, top, atEnd) &&
+		whole(corners.bottomStart, atStart, bottom) &&
+		whole(corners.topStart, top, atStart)
+	)
+		return;
+
+	const doc = td.doc;
+	const cs = td.win.getComputedStyle(td);
+	const edge = {
+		top: cs.borderTopColor,
+		right: cs.borderRightColor,
+		bottom: cs.borderBottomColor,
+		left: cs.borderLeftColor,
+	};
+	const corner = (want: string | null, fallback: string): string =>
+		want === null ? fallback : resolveColor(doc, want);
+	const px = {
+		topLeft: corner(rtl ? corners.topEnd : corners.topStart, edge.top),
+		topRight: corner(rtl ? corners.topStart : corners.topEnd, edge.top),
+		bottomLeft: corner(rtl ? corners.bottomEnd : corners.bottomStart, edge.bottom),
+		bottomRight: corner(rtl ? corners.bottomStart : corners.bottomEnd, edge.bottom),
+	};
+	const dot = (x: number, y: number, color: string): string =>
+		`<rect x="${x}" y="${y}" width="1" height="1" fill="${color}"/>`;
+	const svg =
+		'<svg xmlns="http://www.w3.org/2000/svg" width="3" height="3" shape-rendering="crispEdges">' +
+		dot(0, 0, px.topLeft) +
+		dot(1, 0, edge.top) +
+		dot(2, 0, px.topRight) +
+		dot(0, 1, edge.left) +
+		dot(2, 1, edge.right) +
+		dot(0, 2, px.bottomLeft) +
+		dot(1, 2, edge.bottom) +
+		dot(2, 2, px.bottomRight) +
+		'</svg>';
+	st.borderImage = `url("data:image/svg+xml,${encodeURIComponent(svg)}") 1 stretch`;
 }
 
 /** Our rotation values (+up / -down) to Excel's textRotation (0-90 up, 91-180 down). */
@@ -2623,7 +2700,7 @@ export class SheetView extends TextFileView {
 		st.borderInlineEndColor = this.rowSpill(instance, row).crossed.has(col)
 			? 'transparent'
 			: '';
-		applyBorderStyles(st, f?.borders);
+		applyBorderStyles(td, this.model.cellFormats, row, col, rtl);
 		// The colored corner of a cell with a comment.
 		td.classList.toggle('rtl-sheet-has-comment', !!comment);
 		if (comment) st.setProperty('--rtl-sheet-comment-color', comment.color);
@@ -3397,7 +3474,8 @@ export class SheetView extends TextFileView {
 				this.showMenu(bordersBtn, [
 					{
 						title: 'All borders (every selected cell)',
-						icon: 'grid-3x3',
+						// grid-3x3 is not in Obsidian's icon set, so the item showed no icon.
+						icon: 'table',
 						onClick: () => this.applyBorders('all'),
 					},
 					{
