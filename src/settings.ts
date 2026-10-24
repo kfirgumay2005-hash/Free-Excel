@@ -34,6 +34,8 @@ export interface PluginSettings {
 	defaultRowCount: number;
 	defaultColCount: number;
 	defaultFontSize: number;
+	/** What the zoom scales: both axes, or only the horizontal one (column widths and letters). */
+	zoomAxes: 'both' | 'horizontal';
 	enableFormulas: boolean;
 	/** Toolbar size in percent, on desktop and on mobile (phones and tablets). */
 	toolbarScaleDesktop: number;
@@ -78,6 +80,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	defaultRowCount: 50,
 	defaultColCount: 26,
 	defaultFontSize: 14,
+	zoomAxes: 'both',
 	enableFormulas: true,
 	toolbarScaleDesktop: 100,
 	toolbarScaleMobile: 100,
@@ -161,6 +164,7 @@ export function sanitizeSettings(
 			8,
 			36,
 		),
+		zoomAxes: s.zoomAxes === 'horizontal' ? 'horizontal' : 'both',
 		enableFormulas: !!s.enableFormulas,
 		toolbarScaleDesktop: toInt(
 			s.toolbarScaleDesktop,
@@ -373,6 +377,18 @@ export class SettingsTab extends PluginSettingTab {
 							min: 8,
 							max: 36,
 							step: 1,
+						},
+					},
+					{
+						name: 'Zoom',
+						desc: 'What zooming in and out changes. Both axes: column widths and letters, row heights and numbers, and the text. Horizontal only: the column widths and letters; rows, row numbers and text keep their size.',
+						control: {
+							type: 'dropdown',
+							key: 'zoomAxes',
+							options: {
+								both: 'Both axes',
+								horizontal: 'Horizontal only (columns)',
+							},
 						},
 					},
 					{

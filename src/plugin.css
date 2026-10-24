@@ -131,6 +131,27 @@
 	overscroll-behavior: contain;
 }
 
+/*
+ * A cell must fit in Handsontable's row height, which the row headers and the selection border
+ * follow, or every row pushes the ones below it down and they drift off the cells. A row is the
+ * text line rounded up plus ROW_VERTICAL_PADDING, times the zoom and rounded to whole px. The
+ * padding (--rtl-sheet-cell-pad-y, half of ROW_VERTICAL_PADDING at the zoom) leaves room for the
+ * 1px bottom grid line, the first row's top grid line and that rounding.
+ */
+.rtl-sheet-grid .htCore > tbody > tr > td {
+	padding-top: var(--rtl-sheet-cell-pad-y, 4px);
+	padding-bottom: calc(var(--rtl-sheet-cell-pad-y, 4px) - 1.6px);
+}
+
+.rtl-sheet-grid .htCore > tbody > tr:first-child > td {
+	padding-top: calc(var(--rtl-sheet-cell-pad-y, 4px) - 1px);
+}
+
+/* Resolves var(--…) colors for the border corner images (see applyBorderStyles). */
+.rtl-sheet-color-probe {
+	display: none;
+}
+
 /* ---------- Sheet tabs ---------- */
 
 .rtl-spreadsheet-view .rtl-sheet-tabs {
@@ -138,14 +159,15 @@
 	align-items: stretch;
 	gap: 4px;
 	flex: 0 0 auto;
-	padding: 2px 8px;
+	/* No top padding: the active tab's accent line meets the border above it. */
+	padding: 0 8px 2px;
 	border-top: 1px solid var(--background-modifier-border);
 	background: var(--background-secondary);
 }
 
 .rtl-spreadsheet-view .rtl-sheet-tab-list {
 	display: flex;
-	gap: 2px;
+	gap: 0;
 	min-width: 0;
 	overflow-x: auto;
 	scrollbar-width: thin;

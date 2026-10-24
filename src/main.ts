@@ -145,6 +145,8 @@ const EXPAND_PADDING = 24;
 const MAX_EXPAND_WIDTH = 3000;
 /** Horizontal padding inside a cell, used when measuring text. */
 const CELL_PADDING = 8;
+/** Width of the column of row numbers at 100% (Handsontable's default). */
+const ROW_HEADER_WIDTH = 50;
 
 type BorderMode =
 	| 'all'
@@ -191,37 +193,157 @@ function sanitizeSheetName(name: string): string {
 	return (cleaned || 'Sheet1').slice(0, 31);
 }
 
-/** Draws cell borders as background layers (reliable inside Handsontable's table cells). */
-function applyBorderStyles(st: CSSStyleDeclaration, b?: CellBorders): void {
-	const color = b?.color ?? 'var(--text-normal)';
-	const layer = `linear-gradient(${color}, ${color})`;
-	const images: string[] = [];
-	const sizes: string[] = [];
-	const positions: string[] = [];
-	if (b?.top) {
-		images.push(layer);
-		sizes.push('100% 1px');
-		positions.push('0 0');
-	}
-	if (b?.right) {
-		images.push(layer);
-		sizes.push('1px 100%');
-		positions.push('100% 0');
-	}
-	if (b?.bottom) {
-		images.push(layer);
-		sizes.push('100% 1px');
-		positions.push('0 100%');
-	}
-	if (b?.left) {
-		images.push(layer);
-		sizes.push('1px 100%');
-		positions.push('0 0');
-	}
-	st.backgroundImage = images.join(', ');
-	st.backgroundSize = sizes.join(', ');
-	st.backgroundPosition = positions.join(', ');
-	st.backgroundRepeat = images.length > 0 ? 'no-repeat' : '';
+type BorderSide = 'top' | 'right' | 'bottom' | 'left';
+
+/** What the border renderer needs to know about the grid around a cell; built once per render. */
+interface BorderGrid {
+	/** The merge that covers each merged cell, by "row,col". */
+	merges: Map<string, MergeInfo>;
+	isHidden(row: number): boolean;
+	/** The next row down that is not hidden by a filter, or null. */
+	nextRow(row: number): number | null;
+	/** The first row that is not hidden: it draws the line under the column headers. */
+	firstRow: number;
+	/** Turns a stored color (or '' for the grid line color) into one the corner image can use. */
+	resolve(color: string): string;
+}
+
+/** The color of one side of a cell's borders, or null when that side has no border. */
+function borderColor(b: CellBorders | undefined, side: BorderSide): string | null {
+	return b?.[side] ? (b.color ?? 'var(--text-normal)') : null;
+}
+
+function firstColor(colors: (string | null)[]): string | null {
+	return colors.find((c): c is string => c !== null) ?? null;
+}
+
+function span(from: number, to: number): number[] {
+	const out: number[] = [];
+	for (let i = from; i <= to; i++) out.push(i);
+	return out;
+}
+
+/**
+ * Draws a cell's borders on the grid lines themselves, like Excel. Every cell owns its bottom
+ * and inline-end grid line (the cell's own borders), so a border between two cells is one line,
+ * whichever cell it was set on. A filled cell keeps its grid lines (they only give way to a
+ * border, or to text that spills over them). The first row also owns the line under the column headers and the first column the line next to
+ * the row headers (they come from the cells' top and inline-start borders). A merged cell owns
+ * the lines along its whole bottom and inline-end side, and rows hidden by a filter are skipped.
+ */
+function applyBorderStyles(
+	td: HTMLTableCellElement,
+	grid: BorderGrid,
+	formats: Record<string, CellFormat>,
+	row: number,
+	col: number,
+	rtl: boolean,
+): void {
+	const st = td.style;
+	const start: BorderSide = rtl ? 'right' : 'left';
+	const end: BorderSide = rtl ? 'left' : 'right';
+	const side = (r: number, c: number, s: BorderSide): string | null =>
+		borderColor(formats[key(r, c)]?.borders, s);
+	const mergeOf = (r: number, c: number): MergeInfo | undefined =>
+		grid.merges.get(key(r, c));
+	const sameMerge = (r1: number, c1: number, r2: number, c2: number): boolean => {
+		const m = mergeOf(r1, c1);
+		return m !== undefined && m === mergeOf(r2, c2);
+	};
+	// The grid line under cell (r, c) and the one at its inline end, shared with the neighbors.
+	// There is no line between two cells of the same merge.
+	const lineBelow = (r: number, c: number): string | null => {
+		const next = grid.nextRow(r);
+		if (next === null) return side(r, c, 'bottom');
+		if (sameMerge(r, c, next, c)) return null;
+		return side(r, c, 'bottom') ?? side(next, c, 'top');
+	};
+	const lineAtEnd = (r: number, c: number): string | null => {
+		if (sameMerge(r, c, r, c + 1)) return null;
+		return side(r, c, end) ?? side(r, c + 1, start);
+	};
+
+	const m = mergeOf(row, col);
+	const isAnchor = m !== undefined && m.row === row && m.col === col;
+	const lastRow = isAnchor ? m.row + m.rowspan - 1 : row;
+	const lastCol = isAnchor ? m.col + m.colspan - 1 : col;
+	const below = grid.nextRow(lastRow);
+	const cols = span(col, lastCol);
+	const rows = span(row, lastRow).filter((r) => !grid.isHidden(r));
+	const isTop = row === grid.firstRow;
+
+	const bottom = firstColor(cols.map((c) => lineBelow(lastRow, c)));
+	const atEnd = firstColor(rows.map((r) => lineAtEnd(r, lastCol)));
+	const top = isTop ? firstColor(cols.map((c) => side(row, c, 'top'))) : null;
+	const atStart = col === 0 ? firstColor(rows.map((r) => side(r, 0, start))) : null;
+
+	const bottomColor = bottom ?? '';
+	// Spilled text has made the inline-end line transparent; a border still shows over it.
+	const endColor =
+		atEnd ?? (st.borderInlineEndColor === 'transparent' ? 'transparent' : '');
+	st.borderBottomColor = bottomColor;
+	st.borderInlineEndColor = endColor;
+	st.borderTopColor = top ?? '';
+	st.borderInlineStartColor = atStart ?? '';
+	st.borderImage = '';
+
+	// The browser splits a corner pixel between the cell's two sides: when they differ in color
+	// the corner is a blend, and a border that only the neighbors draw never reaches it. When a
+	// border meets a corner the sides cannot paint whole, draw the frame as a 3×3 image instead.
+	const corners = {
+		bottomEnd: firstColor([
+			bottom,
+			atEnd,
+			lineBelow(lastRow, lastCol + 1),
+			below === null ? null : lineAtEnd(below, lastCol),
+		]),
+		topEnd: isTop ? firstColor([top, atEnd, side(row, lastCol + 1, 'top')]) : null,
+		bottomStart:
+			col === 0
+				? firstColor([atStart, bottom, below === null ? null : side(below, 0, start)])
+				: null,
+		topStart: isTop && col === 0 ? firstColor([top, atStart]) : null,
+	};
+	const whole = (want: string | null, a: string | null, b: string | null): boolean =>
+		want === null || (a === want && b === want);
+	if (
+		whole(corners.bottomEnd, bottom, atEnd) &&
+		whole(corners.topEnd, top, atEnd) &&
+		whole(corners.bottomStart, atStart, bottom) &&
+		whole(corners.topStart, top, atStart)
+	)
+		return;
+
+	// The colors the sides are drawn in, as set above (no computed style, which is slow here).
+	const startColor = grid.resolve(atStart ?? '');
+	const edge = {
+		top: grid.resolve(top ?? ''),
+		bottom: grid.resolve(bottomColor),
+		left: rtl ? grid.resolve(endColor) : startColor,
+		right: rtl ? startColor : grid.resolve(endColor),
+	};
+	const corner = (want: string | null, fallback: string): string =>
+		want === null ? fallback : grid.resolve(want);
+	const px = {
+		topLeft: corner(rtl ? corners.topEnd : corners.topStart, edge.top),
+		topRight: corner(rtl ? corners.topStart : corners.topEnd, edge.top),
+		bottomLeft: corner(rtl ? corners.bottomEnd : corners.bottomStart, edge.bottom),
+		bottomRight: corner(rtl ? corners.bottomStart : corners.bottomEnd, edge.bottom),
+	};
+	const dot = (x: number, y: number, color: string): string =>
+		`<rect x="${x}" y="${y}" width="1" height="1" fill="${color}"/>`;
+	const svg =
+		'<svg xmlns="http://www.w3.org/2000/svg" width="3" height="3" shape-rendering="crispEdges">' +
+		dot(0, 0, px.topLeft) +
+		dot(1, 0, edge.top) +
+		dot(2, 0, px.topRight) +
+		dot(0, 1, edge.left) +
+		dot(2, 1, edge.right) +
+		dot(0, 2, px.bottomLeft) +
+		dot(1, 2, edge.bottom) +
+		dot(2, 2, px.bottomRight) +
+		'</svg>';
+	st.borderImage = `url("data:image/svg+xml,${encodeURIComponent(svg)}") 1 stretch`;
 }
 
 /** Our rotation values (+up / -down) to Excel's textRotation (0-90 up, 91-180 down). */
@@ -908,7 +1030,7 @@ export class SheetView extends TextFileView {
 	/** Set when cells changed while the find bar was open; the next step searches again. */
 	private findStale = false;
 
-	/** View zoom (0.5-3). Scales column widths, row heights and fonts; it is not saved in the file. */
+	/** View zoom (0.5-3) of the column widths; row heights and fonts use zoomY. Not saved in the file. */
 	private zoom = 1;
 	private pinch: { startDistance: number; startZoom: number } | null = null;
 	private pendingZoom = 1;
@@ -928,6 +1050,8 @@ export class SheetView extends TextFileView {
 	private formulaLimitHits = 0;
 	/** Spilled text by row, kept until the sheet changes (like the formula results). */
 	private spillCache = new Map<number, RowSpill>();
+	/** Merges, hidden rows and colors for drawing borders, kept like the spilled text. */
+	private borderGridCache: BorderGrid | null = null;
 	private fontFamilyCache: string | null = null;
 	private measureCtx: CanvasRenderingContext2D | null = null;
 
@@ -1458,7 +1582,8 @@ export class SheetView extends TextFileView {
 		this.renderPalette('fill');
 		this.renderPalette('text');
 
-		if (
+		if (prev.zoomAxes !== s.zoomAxes) this.applyZoomSizes();
+		else if (
 			prev.defaultFontSize !== s.defaultFontSize ||
 			prev.enableFormulas !== s.enableFormulas
 		) {
@@ -1939,11 +2064,14 @@ export class SheetView extends TextFileView {
 		const m = this.model;
 		this.gridEl.setAttr('dir', m.rtl ? 'rtl' : 'ltr');
 		this.gridEl.toggleClass('is-rtl', m.rtl);
+		this.applyZoomStyles();
 
 		this.fontFamilyCache = null;
 		this.invalidateRowSizes();
-		const zoom = this.zoom;
-		const toSizes = (arr: (number | null)[]): (number | undefined)[] =>
+		const toSizes = (
+			arr: (number | null)[],
+			zoom: number,
+		): (number | undefined)[] =>
 			arr.map((v) => (v ? Math.round(v * zoom) : undefined));
 
 		try {
@@ -1953,16 +2081,17 @@ export class SheetView extends TextFileView {
 				themeName: handsontableThemeName(),
 				layoutDirection: m.rtl ? 'rtl' : 'ltr',
 				rowHeaders: true,
+				rowHeaderWidth: this.rowHeaderWidth(),
 				colHeaders: true,
 				width: '100%',
 				height: '100%',
-				manualColumnResize: toSizes(m.colWidths) as number[],
-				manualRowResize: toSizes(m.rowHeights) as number[],
+				manualColumnResize: toSizes(m.colWidths, this.zoom) as number[],
+				manualRowResize: toSizes(m.rowHeights, this.zoomY) as number[],
 				// Functions (instead of auto-sizing) so the user decides column widths, and row heights
 				// always follow the font size; manual resizing still overrides both.
 				colWidths: () => Math.round(DEFAULT_COL_WIDTH * this.zoom),
 				rowHeights: (row: number) =>
-					Math.round(this.computeRowHeight(row) * this.zoom),
+					Math.round(this.computeRowHeight(row) * this.zoomY),
 				mergeCells: m.merges,
 				// Filters hide rows instead of trimming them, so a row keeps its index and the
 				// "row,col" keys and formula references stay valid.
@@ -2014,6 +2143,7 @@ export class SheetView extends TextFileView {
 					this.rowHeightCache.clear();
 					this.formulaCache.clear();
 					this.spillCache.clear();
+					this.borderGridCache = null;
 				},
 				// Charts follow their data: draw them again after every full render.
 				afterRender: (isForced) => {
@@ -2106,7 +2236,7 @@ export class SheetView extends TextFileView {
 					while (this.model.rowHeights.length <= row)
 						this.model.rowHeights.push(null);
 					this.model.rowHeights[row] = Math.round(
-						newSize / this.zoom,
+						newSize / this.zoomY,
 					);
 					this.markDirty();
 				},
@@ -2201,6 +2331,65 @@ export class SheetView extends TextFileView {
 		this.rowHeightCache.clear();
 		this.formulaCache.clear();
 		this.spillCache.clear();
+		this.borderGridCache = null;
+	}
+
+	/**
+	 * Sizes in the grid's CSS that follow the zoom of the vertical axis. The cells' vertical
+	 * padding is part of the row height. Handsontable never makes a row lower than the theme's
+	 * line height plus its padding, so those are zoomed too, or rows could not get smaller than
+	 * at 100% (they also size the headers' text). The values are the main theme's.
+	 */
+	private applyZoomStyles(): void {
+		const z = this.zoomY;
+		this.gridEl.setCssProps({
+			'--rtl-sheet-cell-pad-y': `${(ROW_VERTICAL_PADDING / 2) * z}px`,
+			'--ht-line-height': `${Math.round(20 * z)}px`,
+			'--ht-cell-vertical-padding': `${Math.round(4 * z * 10) / 10}px`,
+			'--ht-font-size': `${Math.round(14 * z * 10) / 10}px`,
+		});
+	}
+
+	private borderGrid(hot: Handsontable.Core): BorderGrid {
+		if (this.borderGridCache) return this.borderGridCache;
+		const merges = new Map<string, MergeInfo>();
+		for (const m of this.liveMerges(hot))
+			for (let r = m.row; r < m.row + m.rowspan; r++)
+				for (let c = m.col; c < m.col + m.colspan; c++)
+					merges.set(key(r, c), m);
+		const hidden = hot.getPlugin('hiddenRows');
+		const isHidden = (row: number): boolean => hidden.isHidden(row);
+		const rows = hot.countRows();
+		const next = new Map<number, number | null>();
+		const nextRow = (row: number): number | null => {
+			const known = next.get(row);
+			if (known !== undefined) return known;
+			let r = row + 1;
+			while (r < rows && isHidden(r)) r++;
+			const found = r < rows ? r : null;
+			next.set(row, found);
+			return found;
+		};
+		let firstRow = 0;
+		while (firstRow < rows && isHidden(firstRow)) firstRow++;
+		// var(--…) and light-dark() colors are worked out inside the grid, where the theme is.
+		const root = hot.rootElement;
+		const colors = new Map<string, string>();
+		const resolve = (color: string): string => {
+			const value = color || 'var(--ht-border-color)';
+			if (value === 'transparent' || /^(#|rgba?\()/i.test(value)) return value;
+			const known = colors.get(value);
+			if (known !== undefined) return known;
+			const probe =
+				root.querySelector<HTMLElement>(':scope > .rtl-sheet-color-probe') ??
+				root.createSpan({ cls: 'rtl-sheet-color-probe' });
+			probe.style.color = value;
+			const out = root.win.getComputedStyle(probe).color || value;
+			colors.set(value, out);
+			return out;
+		};
+		this.borderGridCache = { merges, isHidden, nextRow, firstRow, resolve };
+		return this.borderGridCache;
 	}
 
 	private getRowIndex(): Map<number, number[]> {
@@ -2591,7 +2780,7 @@ export class SheetView extends TextFileView {
 		const wrap = f?.wrap ?? 'overflow';
 		const st = td.style;
 
-		st.fontSize = `${Math.round((f?.fontSize ?? this.plugin.settings.defaultFontSize) * this.zoom * 10) / 10}px`;
+		st.fontSize = `${Math.round((f?.fontSize ?? this.plugin.settings.defaultFontSize) * this.zoomY * 10) / 10}px`;
 		// Line height follows the font size; the theme's fixed line height made big wrapped text overlap.
 		st.lineHeight = String(ROW_LINE_HEIGHT);
 		st.fontWeight = f?.bold ? 'bold' : '';
@@ -2623,7 +2812,14 @@ export class SheetView extends TextFileView {
 		st.borderInlineEndColor = this.rowSpill(instance, row).crossed.has(col)
 			? 'transparent'
 			: '';
-		applyBorderStyles(st, f?.borders);
+		applyBorderStyles(
+			td,
+			this.borderGrid(instance),
+			this.model.cellFormats,
+			row,
+			col,
+			rtl,
+		);
 		// The colored corner of a cell with a comment.
 		td.classList.toggle('rtl-sheet-has-comment', !!comment);
 		if (comment) st.setProperty('--rtl-sheet-comment-color', comment.color);
@@ -2669,7 +2865,7 @@ export class SheetView extends TextFileView {
 		});
 		box.checked = isChecked(value);
 		box.setCssProps({
-			'--rtl-sheet-checkbox-size': `${Math.round(16 * this.zoom)}px`,
+			'--rtl-sheet-checkbox-size': `${Math.round(16 * this.zoomY)}px`,
 		});
 	}
 
@@ -2734,7 +2930,7 @@ export class SheetView extends TextFileView {
 		let own = 0;
 		for (let c = col; c < col + colspan; c++) own += hot.getColWidth(c);
 		const needed =
-			this.measureTextWidth(text, f) * this.zoom + 2 * CELL_PADDING + 2;
+			this.measureTextWidth(text, f) * this.zoomY + 2 * CELL_PADDING + 2;
 		if (needed <= own) return null; // it fits: nothing crosses the cell border
 
 		const visualRight = !/[\u0590-\u08FF]/.test(text);
@@ -2850,7 +3046,7 @@ export class SheetView extends TextFileView {
 			this.model.colWidths[col] || hot.getColWidth(col) / this.zoom;
 		const startH =
 			this.model.rowHeights[row] ||
-			(hot.getRowHeight(row) ?? 0) / this.zoom ||
+			(hot.getRowHeight(row) ?? 0) / this.zoomY ||
 			this.computeRowHeight(row);
 		let width = startW;
 		let height = startH;
@@ -2869,7 +3065,7 @@ export class SheetView extends TextFileView {
 			if (ev.pointerId !== e.pointerId) return;
 			ev.preventDefault();
 			const dx = ((ev.clientX - startX) * signX) / this.zoom;
-			const dy = ((ev.clientY - startY) * signY) / this.zoom;
+			const dy = ((ev.clientY - startY) * signY) / this.zoomY;
 			const factor = Math.min(
 				MAX_IMAGE_RESIZE_PX / Math.max(startW, startH),
 				Math.max(
@@ -3397,7 +3593,8 @@ export class SheetView extends TextFileView {
 				this.showMenu(bordersBtn, [
 					{
 						title: 'All borders (every selected cell)',
-						icon: 'grid-3x3',
+						// grid-3x3 is not in Obsidian's icon set, so the item showed no icon.
+						icon: 'table',
 						onClick: () => this.applyBorders('all'),
 					},
 					{
@@ -5386,8 +5583,8 @@ export class SheetView extends TextFileView {
 				});
 
 			const head = box.createDiv({ cls: 'rtl-sheet-chart-head' });
-			head.style.height = `${CHART_HEAD_H * this.zoom}px`;
-			head.style.fontSize = `${Math.round(13 * this.zoom * 10) / 10}px`;
+			head.style.height = `${CHART_HEAD_H * this.zoomY}px`;
+			head.style.fontSize = `${Math.round(13 * this.zoomY * 10) / 10}px`;
 			const title = head.createSpan({
 				cls: 'rtl-sheet-chart-title',
 				text: chart.title || 'Chart',
@@ -5434,14 +5631,17 @@ export class SheetView extends TextFileView {
 		chart: Pick<ChartSpec, 'x' | 'y' | 'w' | 'h'>,
 		origin: { x: number; y: number },
 	): void {
+		// The position follows the columns and rows; the size follows the text, so a chart keeps
+		// its shape when only the horizontal axis zooms.
 		const z = this.zoom;
+		const zy = this.zoomY;
 		const st = box.style;
-		st.top = `${origin.y + chart.y * z}px`;
+		st.top = `${origin.y + chart.y * zy}px`;
 		// The first column is on the right in a right-to-left sheet.
 		st.left = this.model.rtl ? '' : `${origin.x + chart.x * z}px`;
 		st.right = this.model.rtl ? `${origin.x + chart.x * z}px` : '';
-		st.width = `${chart.w * z}px`;
-		st.height = `${chart.h * z}px`;
+		st.width = `${chart.w * zy}px`;
+		st.height = `${chart.h * zy}px`;
 	}
 
 	/** Dragging the title bar moves a chart, dragging its corner resizes it. One undo step each. */
@@ -5495,13 +5695,13 @@ export class SheetView extends TextFileView {
 
 		const onMove = (ev: PointerEvent): void => {
 			if (ev.pointerId !== e.pointerId) return;
-			const dx = ((ev.clientX - start.x) * dir) / this.zoom;
-			const dy = (ev.clientY - start.y) / this.zoom;
+			const px = (ev.clientX - start.x) * dir;
+			const dy = (ev.clientY - start.y) / this.zoomY;
 			if (mode === 'move') {
-				next.x = Math.max(0, Math.round(chart.x + dx));
+				next.x = Math.max(0, Math.round(chart.x + px / this.zoom));
 				next.y = Math.max(0, Math.round(chart.y + dy));
 			} else {
-				next.w = Math.max(min.w, Math.round(chart.w + dx));
+				next.w = Math.max(min.w, Math.round(chart.w + px / this.zoomY));
 				next.h = Math.max(min.h, Math.round(chart.h + dy));
 				if (keepRatio && !ev.shiftKey && chart.h > 0) {
 					const ratio = chart.w / chart.h;
@@ -5704,7 +5904,7 @@ export class SheetView extends TextFileView {
 
 	/* ---------------- Zoom ---------------- */
 
-	/** Zoom scales widths, heights and fonts together; model values stay at 100%. */
+	/** Zoom scales widths, and heights and fonts unless it is horizontal only (see zoomY); model values stay at 100%. */
 	private applyZoom(next: number): void {
 		const z = Math.min(
 			MAX_ZOOM,
@@ -5712,7 +5912,26 @@ export class SheetView extends TextFileView {
 		);
 		if (z === this.zoom) return;
 		this.zoom = z;
+		this.applyZoomSizes();
+		this.ui.zoomLabel?.setText(`${Math.round(z * 100)}%`);
+	}
 
+	/**
+	 * The zoom of the vertical axis: row heights, the column of row numbers and the text. It is
+	 * the zoom, or 1 when the zoom setting zooms the horizontal axis only (column widths and
+	 * the column letters).
+	 */
+	private get zoomY(): number {
+		return this.plugin.settings.zoomAxes === 'horizontal' ? 1 : this.zoom;
+	}
+
+	private rowHeaderWidth(): number {
+		return Math.round(ROW_HEADER_WIDTH * this.zoomY);
+	}
+
+	/** Hands the zoomed sizes to the grid, after a zoom or a change of the zoom setting. */
+	private applyZoomSizes(): void {
+		this.applyZoomStyles();
 		const hot = this.hot;
 		if (hot && !hot.isDestroyed) {
 			const cols = hot.getPlugin('manualColumnResize') as unknown as {
@@ -5722,15 +5941,19 @@ export class SheetView extends TextFileView {
 				setManualSize(r: number, h: number): void;
 			};
 			this.model.colWidths.forEach((w, i) => {
-				if (w) cols.setManualSize(i, Math.round(w * z));
+				if (w) cols.setManualSize(i, Math.round(w * this.zoom));
 			});
 			this.model.rowHeights.forEach((h, i) => {
-				if (h) rows.setManualSize(i, Math.round(h * z));
+				if (h) rows.setManualSize(i, Math.round(h * this.zoomY));
 			});
-				hot.render();
-				hot.refreshDimensions();
-			}
-		this.ui.zoomLabel?.setText(`${Math.round(z * 100)}%`);
+			// Handsontable keeps the theme's sizes, and its smallest row height comes from them.
+			(
+				hot as unknown as { stylesHandler?: { clearCache?(): void } }
+			).stylesHandler?.clearCache?.();
+			this.invalidateRowSizes();
+			hot.updateSettings({ rowHeaderWidth: this.rowHeaderWidth() });
+			hot.refreshDimensions();
+		}
 		this.queueCharts();
 	}
 
@@ -5833,7 +6056,7 @@ export class SheetView extends TextFileView {
 		const plugin = hot.getPlugin('manualRowResize') as unknown as {
 			setManualSize(row: number, height: number): void;
 		};
-		plugin.setManualSize(row, Math.round(height * this.zoom));
+		plugin.setManualSize(row, Math.round(height * this.zoomY));
 		while (this.model.rowHeights.length <= row)
 			this.model.rowHeights.push(null);
 		this.model.rowHeights[row] = height;

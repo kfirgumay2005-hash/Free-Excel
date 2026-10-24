@@ -27,7 +27,7 @@ Excel-style spreadsheet for Obsidian with full RTL support, built on Handsontabl
 ## Rules that are easy to break
 
 - `tsconfig` uses `strict` and `noUncheckedIndexedAccess`: every `arr[i]` may be `undefined`, so guard it or give it a default.
-- The model stores sizes at 100% zoom. Zoom is view-only and is applied when sizes are handed to Handsontable.
+- The model stores sizes at 100% zoom. Zoom is view-only and is applied when sizes are handed to Handsontable. Column widths use `zoom`; row heights, the column of row numbers (`rowHeaderWidth`), fonts and chart sizes use `zoomY`, which is 1 when the "Zoom" setting is "Horizontal only". Handsontable never makes a row lower than its theme's line height plus padding, so `applyZoomStyles` zooms those CSS variables too.
 - Per-cell data is keyed `"row,col"`. When rows or columns are inserted or removed, remap every keyed map (`cellFormats`, `images`, `imageSizes`, `comments`, `links`, `widenRecords`) in `remapCellMaps`, and add new ones to `RowsSnapshot` (sorting) and `SideState` (undo).
 - Visual and physical row/column indexes must stay equal: filters hide rows with the `hiddenRows` plugin (view-only, not saved), and sorting rewrites the rows themselves (`sortByColumn`). Never enable Handsontable's `filters`, `columnSorting` or trimming plugins.
 - Undo: Handsontable undoes cell values, merges and inserted or removed rows and columns. Everything else in the model (`SideState`: formats, images, sizes) is recorded by `recordSideChanges`, which runs after every `markDirty()` and attaches the difference to the same undo step. So call `markDirty()` after every model change, and replace format and image-size objects instead of changing them in place (they are compared by identity).
