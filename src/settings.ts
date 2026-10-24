@@ -522,7 +522,6 @@ export class SettingsTab extends PluginSettingTab {
 											this.plugin.settings
 												.selectionHandleScale,
 										)
-										.setDynamicTooltip()
 										.onChange((value) =>
 											this.setControlValue(
 												'selectionHandleScale',

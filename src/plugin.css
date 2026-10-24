@@ -877,7 +877,6 @@
 .rtl-sheet-grid .rtl-sheet-link {
 	color: var(--link-external-color, var(--text-accent));
 	text-decoration: underline;
-	text-decoration-color: color-mix(in srgb, currentColor 50%, transparent);
 }
 
 /* A comment marks the top right corner of its cell (like Excel). */

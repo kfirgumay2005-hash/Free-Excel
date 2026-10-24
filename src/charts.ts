@@ -378,15 +378,11 @@ function svg<K extends keyof SVGElementTagNameMap>(
 	attrs: SvgAttrs = {},
 	style: Partial<Record<'fill' | 'stroke', string | undefined>> = {},
 ): SVGElementTagNameMap[K] {
-	const el = parent.ownerDocument.createElementNS(
-		'http://www.w3.org/2000/svg',
-		tag,
-	);
+	const el = parent.createSvg(tag);
 	for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
 	// CSS variables only work through style, not through presentation attributes.
 	if (style.fill) el.style.fill = style.fill;
 	if (style.stroke) el.style.stroke = style.stroke;
-	parent.appendChild(el);
 	return el;
 }
 
