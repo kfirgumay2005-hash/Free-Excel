@@ -38,6 +38,11 @@ Excel-style spreadsheet for Obsidian with full RTL support, built on Handsontabl
 - Sheet files use the `.sheet` extension and fall back to `.rtlsheet` when another plugin owns it.
 - API keys are kept in Obsidian's secret storage (`app.secretStorage`, Obsidian 1.13.2+) under fixed IDs (`aiKeySecretId`); the settings tab shows one password field per key. `claudeKeySecret`/`geminiKeySecret` are only read as a fallback from the earlier secret picker. Requests go through `requestUrl` (no CORS, works on mobile).
 - Floating images and charts are drawn on the chart layer and positioned in px at 100% zoom from A1; they are replaced, never changed in place.
+- Floating images and charts share one stacking order: `z` on both, drawn bottom-up by `layerOrder()`; new ones get `topZ()`. Find a box on the layer by its `data-id`, never by its index.
+- `normalizeCharts` rebuilds every chart field by field when a file loads: add each new optional `ChartSpec` field to `normalizeChartExtras` (`charts.ts`), or it is lost on reopen.
+- Every chart type reads two ranges: `xRange` (labels, slice names or X values) and `range` (a series per column). Without `xRange` the first column of `range` holds the labels, unless `noLabels` is set.
+- Handsontable's Ctrl+C/Ctrl+V carries text only. Formats (check boxes too) go through the module-level `copiedCells`: kept in `beforeCopy`/`beforeCut` and put back in `afterPaste` when the pasted text is the same.
+- The chart layer is emptied and drawn again after every forced render (`queueCharts`), so a CSS animation on it restarts each time and looks frozen: give it a negative `animation-delay` from the clock (see `renderCopyMark`). When a setting controls motion, do not also turn it off for `prefers-reduced-motion` (Windows "Animation effects" off sets it).
 - The Handsontable license key is non-commercial: a commercial release needs its own license.
 
 ## Verification

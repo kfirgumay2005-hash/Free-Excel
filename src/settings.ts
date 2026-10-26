@@ -51,6 +51,10 @@ export interface PluginSettings {
 	ctrlGFind: boolean;
 	/** Show a cell's comment and link when the mouse is over it (off: only when the cell is selected). */
 	commentsOnHover: boolean;
+	/** The dashes around copied cells: which way they move, or still. */
+	copyMarkMotion: 'right' | 'left' | 'still';
+	/** How fast the dashes move, 1 (slow) to 10 (fast). */
+	copyMarkSpeed: number;
 	/** Names of the API keys in Obsidian's secret storage (the keys themselves are not saved here). */
 	claudeKeySecret: string;
 	geminiKeySecret: string;
@@ -90,6 +94,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	savedTextColors: [],
 	ctrlGFind: false,
 	commentsOnHover: false,
+	copyMarkMotion: 'right',
+	copyMarkSpeed: 5,
 	claudeKeySecret: '',
 	geminiKeySecret: '',
 	claudeModel: DEFAULT_CLAUDE_MODEL,
@@ -189,6 +195,16 @@ export function sanitizeSettings(
 		savedTextColors: toColors(s.savedTextColors),
 		ctrlGFind: !!s.ctrlGFind,
 		commentsOnHover: !!s.commentsOnHover,
+		copyMarkMotion:
+			s.copyMarkMotion === 'left' || s.copyMarkMotion === 'still'
+				? s.copyMarkMotion
+				: 'right',
+		copyMarkSpeed: toInt(
+			s.copyMarkSpeed,
+			DEFAULT_SETTINGS.copyMarkSpeed,
+			1,
+			10,
+		),
 		claudeKeySecret: toText(s.claudeKeySecret, ''),
 		geminiKeySecret: toText(s.geminiKeySecret, ''),
 		claudeModel: toText(s.claudeModel, DEFAULT_CLAUDE_MODEL),
@@ -400,6 +416,30 @@ export class SettingsTab extends PluginSettingTab {
 						name: 'Show comments on hover',
 						desc: 'Show the comment and link of a cell as soon as the mouse is over it. When off, they show only when you click the cell.',
 						control: { type: 'toggle', key: 'commentsOnHover' },
+					},
+					{
+						name: 'Copied cells outline',
+						desc: 'Copied cells get a dashed outline until you paste or press Esc. Choose which way the dashes move along the top edge, or keep them still.',
+						control: {
+							type: 'dropdown',
+							key: 'copyMarkMotion',
+							options: {
+								right: 'Moving right (clockwise)',
+								left: 'Moving left (counterclockwise)',
+								still: 'Still',
+							},
+						},
+					},
+					{
+						name: 'Copied cells outline speed',
+						desc: 'How fast the dashes move, from 1 (slow) to 10 (fast).',
+						control: {
+							type: 'slider',
+							key: 'copyMarkSpeed',
+							min: 1,
+							max: 10,
+							step: 1,
+						},
 					},
 				],
 			},

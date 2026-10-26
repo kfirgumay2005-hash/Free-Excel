@@ -80,6 +80,66 @@ function toText(v: Scalar): string {
 	return String(v);
 }
 
+/**
+ * The optional fields of a chart read from a file (the look, the stacking order and
+ * `noLabels`); a field with the wrong type is left out, so the default applies.
+ */
+export function normalizeChartExtras(item: object): Partial<ChartSpec> {
+	const raw = item as Record<string, unknown>;
+	const out: Partial<ChartSpec> = {};
+	const num = (v: unknown): number | undefined =>
+		typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+	const str = (v: unknown): string | undefined =>
+		typeof v === 'string' ? v : undefined;
+	const bool = (v: unknown): boolean | undefined =>
+		typeof v === 'boolean' ? v : undefined;
+	const axis = (v: unknown): AxisStyle | undefined => {
+		if (!v || typeof v !== 'object') return undefined;
+		const a = v as Record<string, unknown>;
+		return {
+			title: str(a.title),
+			min: num(a.min),
+			max: num(a.max),
+			showLabels: bool(a.showLabels),
+		};
+	};
+	out.noLabels = bool(raw.noLabels) || undefined;
+	out.showEquation = bool(raw.showEquation);
+	out.showR2 = bool(raw.showR2);
+	out.bg = str(raw.bg);
+	out.fontSize = num(raw.fontSize);
+	out.titleColor = str(raw.titleColor);
+	out.pointSize = num(raw.pointSize);
+	out.lineWidth = num(raw.lineWidth);
+	out.donutHole = num(raw.donutHole);
+	const legend = str(raw.legend);
+	out.legend = ['bottom', 'top', 'right', 'none'].includes(legend ?? '')
+		? (legend as LegendPosition)
+		: undefined;
+	out.xAxis = axis(raw.xAxis);
+	out.yAxis = axis(raw.yAxis);
+	out.gridlines = bool(raw.gridlines);
+	out.xGridlines = bool(raw.xGridlines);
+	out.gridColor = str(raw.gridColor);
+	if (Array.isArray(raw.series))
+		out.series = (raw.series as unknown[]).map((v): SeriesStyle => {
+			const st = (v && typeof v === 'object' ? v : {}) as Record<
+				string,
+				unknown
+			>;
+			return {
+				color: str(st.color),
+				trendline: bool(st.trendline),
+				trendColor: str(st.trendColor),
+			};
+		});
+	out.z = num(raw.z);
+	// Fields that were missing stay missing in the file.
+	for (const k of Object.keys(out) as (keyof ChartSpec)[])
+		if (out[k] === undefined) delete out[k];
+	return out;
+}
+
 /* ------------------------------------------------------------------ */
 /* Ranges                                                               */
 /* ------------------------------------------------------------------ */
@@ -129,17 +189,17 @@ export function guessHeaderRow(range: SelRange, read: CellReader): boolean {
 }
 
 /**
- * The values a chart shows. With two or more columns the first one holds the labels (or the
- * X values of a scatter chart) and every other column is a series; a single column is one
+ * The values a chart shows. With a labels range (`xRange`) every column of the range is a
+ * series. Without one, two or more columns have the labels (or the X values of a scatter
+ * chart) in the first column and a series in every other column; a single column is one
  * series numbered 1, 2, 3...
  */
 export function readChartData(spec: ChartSpec, read: CellReader): ChartData {
-	if (spec.type === 'scatter' && spec.xRange)
-		return readXYData(spec, spec.xRange, read);
+	if (spec.xRange) return readXYData(spec, spec.xRange, read);
 	const { r1, c1, c2 } = spec.range;
 	const r2 = Math.min(spec.range.r2, r1 + MAX_POINTS);
 	const firstRow = spec.headerRow ? r1 + 1 : r1;
-	const hasLabels = c2 > c1;
+	const hasLabels = c2 > c1 && !spec.noLabels;
 	const cols: number[] = [];
 	for (let c = hasLabels ? c1 + 1 : c1; c <= c2; c++) cols.push(c);
 
@@ -186,8 +246,8 @@ function rangeLines(rg: SelRange): [number, number][][] {
 }
 
 /**
- * Scatter chart with its own X range: the n-th X value goes with the n-th Y value of every
- * series (each column of the Y range, or its only row).
+ * A chart with its own labels range: the n-th label (X value of a scatter chart) goes with
+ * the n-th value of every series (each column of the values range, or its only row).
  */
 function readXYData(
 	spec: ChartSpec,
@@ -226,7 +286,12 @@ function readXYData(
 		const cell = xLine[i];
 		const x = cell ? read(cell[0], cell[1]) : null;
 		const ys = ySeries.map((s) => s.values[i] ?? null);
-		if (toNumber(x) === null && ys.every((v) => v === null)) continue;
+		// Leaves out empty rows; a scatter chart cannot place a point without a number for X.
+		const noX =
+			spec.type === 'scatter'
+				? toNumber(x) === null
+				: toText(x).trim() === '';
+		if (noX && ys.every((v) => v === null)) continue;
 		categories.push(toText(x));
 		xValues.push(toNumber(x));
 		ys.forEach((v, j) => series[j]?.values.push(v));
@@ -1079,9 +1144,7 @@ export class ChartEditor {
 		if (spec) {
 			this.syncText(spec);
 			// A new chart is waiting for its data; an existing one must not change by accident.
-			if (isNew)
-				this.armed =
-					spec.type === 'scatter' && !spec.xRange ? 'x' : 'y';
+			if (isNew) this.armed = spec.xRange ? 'y' : 'x';
 		}
 		host.el.addEventListener('keydown', this.onKeyDown);
 		this.render();
@@ -1110,15 +1173,25 @@ export class ChartEditor {
 		this.text[field] = formatRange(rg);
 		const input = this.inputs[field];
 		if (input) input.value = this.text[field];
-		this.applyRange(field, rg);
-		// X first, then Y.
+		this.applyRanges(field);
+		// Labels first, then values.
 		if (field === 'x') this.arm('y');
 		return true;
 	}
 
+	/**
+	 * Fills the range fields from the chart. A chart without a labels range takes them from
+	 * the first column of its data, so that column shows in the labels field.
+	 */
 	private syncText(spec: ChartSpec): void {
-		this.text.x = spec.xRange ? formatRange(spec.xRange) : '';
-		this.text.y = formatRange(spec.range);
+		const rg = spec.range;
+		const split = !spec.xRange && !spec.noLabels && rg.c2 > rg.c1;
+		this.text.x = spec.xRange
+			? formatRange(spec.xRange)
+			: split
+				? formatRange({ ...rg, c2: rg.c1 })
+				: '';
+		this.text.y = formatRange(split ? { ...rg, c1: rg.c1 + 1 } : rg);
 	}
 
 	private readonly onKeyDown = (e: KeyboardEvent): void => {
@@ -1138,19 +1211,30 @@ export class ChartEditor {
 			input?.toggleClass('is-armed', name === field);
 	}
 
-	private applyRange(field: RangeField, rg: SelRange): void {
+	/**
+	 * Writes both fields to the chart (the one that was not touched may still show the labels
+	 * column of a chart that had none). An empty labels field removes the labels range.
+	 */
+	private applyRanges(field: RangeField): void {
+		const x = parseRangeText(this.text.x);
+		const y = parseRangeText(this.text.y);
+		const noLabels = this.text.x.trim() === '';
 		this.set(`range-${field}`, (s) => {
-			if (field === 'x') s.xRange = rg;
-			else s.range = rg;
+			if (y) s.range = y;
+			if (x) {
+				s.xRange = x;
+				delete s.noLabels;
+			} else if (noLabels) {
+				delete s.xRange;
+				s.noLabels = true;
+			}
 		});
 		this.errorEl?.setText('');
 		this.emitHighlight();
 	}
 
 	private emitHighlight(): void {
-		const spec = this.host.get();
-		const fields: RangeField[] =
-			spec?.type === 'scatter' ? ['x', 'y'] : ['y'];
+		const fields: RangeField[] = ['x', 'y'];
 		this.host.highlight(
 			fields.flatMap((f) => {
 				const rg = parseRangeText(this.text[f]);
@@ -1332,7 +1416,6 @@ export class ChartEditor {
 	/* ---------------- Setup ---------------- */
 
 	private renderSetup(body: HTMLElement, spec: ChartSpec): void {
-		const scatter = spec.type === 'scatter';
 		this.select(
 			body,
 			'Chart type',
@@ -1340,21 +1423,22 @@ export class ChartEditor {
 			spec.type,
 			(value) => this.changeType(value),
 		);
-		if (scatter) {
-			this.rangeField(body, 'x', 'X axis values');
-			this.rangeField(body, 'y', 'Y axis values (a series per column)');
-		} else {
-			this.rangeField(
-				body,
-				'y',
-				spec.type === 'pie'
-					? 'Data range (labels, then values)'
-					: 'Data range (labels, then a series per column)',
-			);
-		}
+		const [labels, values] =
+			spec.type === 'scatter'
+				? ['X axis values', 'Y axis values (a series per column)']
+				: spec.type === 'pie'
+					? ['Slice names', 'Slice values']
+					: [
+							spec.type === 'bar'
+								? 'Labels (vertical axis)'
+								: 'Labels (horizontal axis)',
+							'Values (a series per column)',
+						];
+		this.rangeField(body, 'x', labels);
+		this.rangeField(body, 'y', values);
 		body.createDiv({
 			cls: 'rtl-chart-ed-hint',
-			text: 'Click a range field, then select the cells in the sheet, or type the range.',
+			text: 'Click a range field, then select the cells in the sheet, or type the range. With no labels, the points are numbered 1, 2, 3.',
 		});
 		this.errorEl = body.createDiv({ cls: 'rtl-chart-ed-error' });
 		this.check(body, 'Use the first row as names', spec.headerRow, (v) =>
@@ -1382,7 +1466,8 @@ export class ChartEditor {
 		input.addEventListener('input', () => {
 			this.text[f] = input.value;
 			const rg = parseRangeText(input.value);
-			if (rg) this.applyRange(f, rg);
+			// Clearing the labels field is a change too: the points get numbers.
+			if (rg || (f === 'x' && !input.value.trim())) this.applyRanges(f);
 			else
 				this.errorEl?.setText(
 					input.value.trim()
@@ -1393,31 +1478,10 @@ export class ChartEditor {
 		this.inputs[f] = input;
 	}
 
-	/** Switching to or from a scatter chart splits the first column off as X, or joins it back. */
+	/** Every type reads the same two ranges: labels (X values) and values. */
 	private changeType(next: ChartType): void {
-		const spec = this.host.get();
-		if (!spec) return;
-		const prev = spec.type;
-		const x = spec.xRange;
-		const y = spec.range;
 		this.set('type', (s) => {
 			s.type = next;
-			if (next === 'scatter' && prev !== 'scatter') {
-				if (!x && y.c2 > y.c1) {
-					s.xRange = { ...y, c2: y.c1 };
-					s.range = { ...y, c1: y.c1 + 1 };
-				}
-			} else if (next !== 'scatter' && prev === 'scatter') {
-				if (
-					x &&
-					x.c1 === x.c2 &&
-					x.c2 + 1 === y.c1 &&
-					x.r1 === y.r1 &&
-					x.r2 === y.r2
-				)
-					s.range = { ...y, c1: x.c1 };
-				delete s.xRange;
-			}
 		});
 		const updated = this.host.get();
 		if (updated) this.syncText(updated);

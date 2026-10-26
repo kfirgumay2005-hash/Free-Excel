@@ -66,6 +66,8 @@ export interface FloatingImage {
 	y: number;
 	w: number;
 	h: number;
+	/** Stacking order among charts and floating images: higher is drawn on top (missing = 0). */
+	z?: number;
 }
 
 /** Remembers a cell's size from before an image resized it, so deleting the image can restore it. */
@@ -109,10 +111,15 @@ export interface ChartSpec {
 	id: string;
 	type: ChartType;
 	title: string;
-	/** The cells the chart shows (0-based, inclusive); the Y values of a scatter chart. */
+	/** The values the chart shows (0-based, inclusive): a series per column. */
 	range: SelRange;
-	/** Scatter charts: the X values (when missing, the first column of `range` holds them). */
+	/**
+	 * The labels (slice names of a pie chart, X values of a scatter chart). When missing and
+	 * `range` has two or more columns, its first column holds them.
+	 */
 	xRange?: SelRange;
+	/** There are no labels (the labels field was cleared): every column is a series. */
+	noLabels?: boolean;
 	/** The first row of the range holds the series names. */
 	headerRow: boolean;
 	/** Scatter charts: a linear trendline for every series. */
@@ -146,6 +153,8 @@ export interface ChartSpec {
 	y: number;
 	w: number;
 	h: number;
+	/** Stacking order among charts and floating images: higher is drawn on top (missing = 0). */
+	z?: number;
 }
 
 export interface SheetModel {

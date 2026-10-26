@@ -85,6 +85,7 @@ import {
 	CHART_TYPES,
 	ChartEditor,
 	guessHeaderRow,
+	normalizeChartExtras,
 	readChartData,
 	renderChart,
 } from './charts';
@@ -170,6 +171,23 @@ function sourceText(value: unknown): string {
 		return String(value);
 	return '';
 }
+
+/** A copied block of cells (Ctrl+C or Ctrl+X): the text that went to the clipboard and the formats. */
+interface CopiedCells {
+	text: string[][];
+	formats: (CellFormat | undefined)[][];
+	/** Where the cells came from, outlined with moving dashes until a paste, Esc or typing. */
+	mark: { view: SheetView; sheet: number; range: SelRange } | null;
+}
+
+/**
+ * The cells copied last, in any sheet. The clipboard only carries text, so a paste whose
+ * text is the same puts these formats (check boxes too) on the pasted cells.
+ */
+let copiedCells: CopiedCells | null = null;
+
+const clipboardText = (data: unknown[][]): string[][] =>
+	data.map((row) => row.map((v) => sourceText(v).trim()));
 
 /** Handsontable theme that follows the active Obsidian theme (light/dark). */
 function handsontableThemeName(): string {
@@ -1085,6 +1103,8 @@ export class SheetView extends TextFileView {
 		y: number;
 		pointerId: number;
 	} | null = null;
+	/** Set while a paste of copied cells runs: their formats go on the pasted cells. */
+	private pasteFormats: CopiedCells | null = null;
 
 	constructor(leaf: WorkspaceLeaf, plugin: RtlSpreadsheetPlugin) {
 		super(leaf);
@@ -1163,6 +1183,7 @@ export class SheetView extends TextFileView {
 		});
 		this.applyToolbarScale();
 		this.applySelectionHandleSettings();
+		this.applyCopyMarkSettings();
 		this.installAutosave();
 		this.installRefreshTimer();
 		// Sync plugins that write through the vault are picked up right away, the timer covers the rest.
@@ -1579,6 +1600,7 @@ export class SheetView extends TextFileView {
 		}
 		this.applyToolbarScale();
 		this.applySelectionHandleSettings();
+		this.applyCopyMarkSettings();
 		this.renderPalette('fill');
 		this.renderPalette('text');
 
@@ -1670,6 +1692,7 @@ export class SheetView extends TextFileView {
 				y: Math.max(0, num(item.y, 0)),
 				w: Math.max(CHART_MIN_W, num(item.w, CHART_DEFAULT_W)),
 				h: Math.max(CHART_MIN_H, num(item.h, CHART_DEFAULT_H)),
+				...normalizeChartExtras(item),
 			});
 		}
 		return out;
@@ -1765,6 +1788,9 @@ export class SheetView extends TextFileView {
 				y: Math.max(0, num(item.y, 0)),
 				w: Math.max(FLOAT_MIN_PX, num(item.w, 200)),
 				h: Math.max(FLOAT_MIN_PX, num(item.h, 150)),
+				...(typeof item.z === 'number' && Number.isFinite(item.z)
+					? { z: item.z }
+					: {}),
 			});
 		}
 		return out;
@@ -2152,6 +2178,9 @@ export class SheetView extends TextFileView {
 				afterChange: (changes, source) => {
 					this.invalidateRowSizes();
 					if (source === 'loadData' || this.loading) return;
+					// Typing in a cell ends the copy outline; a paste and the cut itself do not.
+					if (source !== 'CopyPaste.paste' && source !== 'CopyPaste.cut')
+						this.clearCopyMark();
 					const expandCols: number[] = [];
 					for (const change of changes ?? []) {
 						const [row, prop] = change as unknown as [
@@ -2253,6 +2282,10 @@ export class SheetView extends TextFileView {
 				afterAutofill: (_fillData, sourceRange, targetRange) => {
 					this.copyFormatsOnFill(sourceRange, targetRange);
 				},
+				beforeCopy: (data, coords) => this.rememberCopiedCells(data, coords),
+				beforeCut: (data, coords) => this.rememberCopiedCells(data, coords),
+				beforePaste: (data) => this.beforePasteCells(data),
+				afterPaste: (_data, coords) => this.pasteCopiedFormats(coords),
 			};
 
 			this.hot = new Handsontable(this.gridEl, options);
@@ -2323,6 +2356,139 @@ export class SheetView extends TextFileView {
 				else delete this.model.cellFormats[key(r, c)];
 			}
 		}
+	}
+
+	/** Keeps the formats of the cells that are being copied, for the paste (see `copiedCells`). */
+	private rememberCopiedCells(
+		data: unknown[][],
+		coords: { startRow: number; startCol: number; endRow: number; endCol: number }[],
+	): void {
+		this.clearCopyMark();
+		copiedCells = null;
+		const hot = this.hot;
+		const rg = coords.length === 1 ? coords[0] : undefined;
+		if (!hot || hot.isDestroyed || !rg) return;
+		const r1 = Math.max(0, Math.min(rg.startRow, rg.endRow));
+		const r2 = Math.max(rg.startRow, rg.endRow);
+		const c1 = Math.max(0, Math.min(rg.startCol, rg.endCol));
+		const c2 = Math.max(rg.startCol, rg.endCol);
+		// Rows hidden by a filter are not copied.
+		const hidden = hot.getPlugin('hiddenRows');
+		const rows: number[] = [];
+		for (let r = r1; r <= r2; r++) if (!hidden.isHidden(r)) rows.push(r);
+		if (rows.length !== data.length) return;
+		const formats = rows.map((r) => {
+			const line: (CellFormat | undefined)[] = [];
+			for (let c = c1; c <= c2; c++) {
+				const f = this.model.cellFormats[key(r, c)];
+				line.push(f ? cloneFormat(f) : undefined);
+			}
+			return line;
+		});
+		copiedCells = {
+			text: clipboardText(data),
+			formats,
+			mark: {
+				view: this,
+				sheet: this.activeSheet,
+				range: { r1, r2, c1, c2 },
+			},
+		};
+		this.queueCharts(); // draws the mark
+	}
+
+	/** Removes the moving outline of the copied cells (the copy itself can still be pasted). */
+	clearCopyMark(): void {
+		const copied = copiedCells;
+		if (!copied?.mark) return;
+		const view = copied.mark.view;
+		copied.mark = null;
+		view.queueCharts();
+	}
+
+	/** The moving dashed outline of the copied cells, drawn on the chart layer. */
+	private renderCopyMark(
+		hot: Handsontable.Core,
+		layer: HTMLElement,
+		origin: { x: number; y: number },
+	): void {
+		const mark = copiedCells?.mark;
+		if (!mark || mark.view !== this || mark.sheet !== this.activeSheet) return;
+		const { r1, r2, c1, c2 } = mark.range;
+		const hidden = hot.getPlugin('hiddenRows');
+		const rowSpan = (from: number, to: number): number => {
+			let h = 0;
+			for (let r = from; r < to; r++)
+				if (!hidden.isHidden(r)) h += hot.getRowHeight(r) ?? 0;
+			return h;
+		};
+		const colSpan = (from: number, to: number): number => {
+			let w = 0;
+			for (let c = from; c < to; c++) w += hot.getColWidth(c);
+			return w;
+		};
+		const x = colSpan(0, c1);
+		const y = rowSpan(0, r1);
+		const box = layer.createDiv({ cls: 'rtl-sheet-copy-mark' });
+		const st = box.style;
+		// Over the grid line before the first cell, like the selection outline.
+		st.top = `${origin.y + y - 1}px`;
+		st.left = this.model.rtl ? '' : `${origin.x + x - 1}px`;
+		st.right = this.model.rtl ? `${origin.x + x - 1}px` : '';
+		st.width = `${colSpan(c1, c2 + 1) + 1}px`;
+		st.height = `${rowSpan(r1, r2 + 1) + 1}px`;
+		// The layer is drawn again after every change; starting at the same point of the cycle
+		// keeps the dashes moving instead of jumping back to the start each time.
+		const cycle = 2.5 / this.plugin.settings.copyMarkSpeed;
+		st.animationDelay = `-${((performance.now() / 1000) % cycle).toFixed(3)}s`;
+	}
+
+	/** A paste of the cells copied last: check boxes get their TRUE/FALSE values back. */
+	private beforePasteCells(data: unknown[][]): void {
+		this.clearCopyMark(); // any paste ends the outline
+		const copied = copiedCells;
+		const text = clipboardText(data);
+		const same =
+			!!copied &&
+			copied.text.length === text.length &&
+			copied.text.every(
+				(row, r) =>
+					row.length === text[r]?.length &&
+					row.every((v, c) => v === text[r]?.[c]),
+			);
+		this.pasteFormats = same ? copied : null;
+		if (!copied || !same) return;
+		data.forEach((row, r) =>
+			row.forEach((v, c) => {
+				if (!copied.formats[r]?.[c]?.checkbox) return;
+				const t = sourceText(v).trim();
+				if (/^(true|false)$/i.test(t)) row[c] = /^true$/i.test(t);
+			}),
+		);
+	}
+
+	/** Puts the copied formats on the pasted cells, repeated when the paste fills a larger area. */
+	private pasteCopiedFormats(
+		coords: { startRow: number; startCol: number; endRow: number; endCol: number }[],
+	): void {
+		const copied = this.pasteFormats;
+		this.pasteFormats = null;
+		const h = copied?.formats.length ?? 0;
+		const w = copied?.formats[0]?.length ?? 0;
+		if (!copied || h === 0 || w === 0) return;
+		for (const rg of coords) {
+			const r1 = Math.min(rg.startRow, rg.endRow);
+			const c1 = Math.min(rg.startCol, rg.endCol);
+			for (let r = r1; r <= Math.max(rg.startRow, rg.endRow); r++)
+				for (let c = c1; c <= Math.max(rg.startCol, rg.endCol); c++) {
+					const f = copied.formats[(r - r1) % h]?.[(c - c1) % w];
+					if (f) this.model.cellFormats[key(r, c)] = cloneFormat(f);
+					else delete this.model.cellFormats[key(r, c)];
+				}
+		}
+		this.markDirty(); // the same undo step as the pasted values
+		this.hot?.render();
+		this.refreshToolbarState();
 	}
 
 	/** Row heights are computed from the fonts; call after anything that can change them. */
@@ -3125,6 +3291,18 @@ export class SheetView extends TextFileView {
 		hot.addHook('afterDeselect', queue);
 		hot.addHook('afterViewRender', queue);
 		this.placeSelectionHandles();
+	}
+
+	/** Which way the dashes around copied cells move, and how fast, are settings. */
+	private applyCopyMarkSettings(): void {
+		const s = this.plugin.settings;
+		this.gridEl.setCssProps({
+			'--rtl-sheet-ant-duration': `${2.5 / s.copyMarkSpeed}s`,
+			'--rtl-sheet-ant-direction':
+				s.copyMarkMotion === 'left' ? 'reverse' : 'normal',
+			'--rtl-sheet-ant-state':
+				s.copyMarkMotion === 'still' ? 'paused' : 'running',
+		});
 	}
 
 	/** The size of the handles and how many of them show are settings. */
@@ -4137,7 +4315,11 @@ export class SheetView extends TextFileView {
 		return select;
 	}
 
-	private showMenu(anchor: HTMLElement, entries: MenuEntry[]): void {
+	/** Shows a menu under a button, or where the pointer is (a right-click). */
+	private showMenu(
+		anchor: HTMLElement | MouseEvent,
+		entries: MenuEntry[],
+	): void {
 		const menu = new Menu();
 		for (const entry of entries) {
 			menu.addItem((item) => {
@@ -4146,6 +4328,10 @@ export class SheetView extends TextFileView {
 					.onClick(entry.onClick);
 				if (entry.checked !== undefined) item.setChecked(entry.checked);
 			});
+		}
+		if (anchor instanceof MouseEvent) {
+			menu.showAtMouseEvent(anchor);
+			return;
 		}
 		const rect = anchor.getBoundingClientRect();
 		menu.showAtPosition({ x: rect.left, y: rect.bottom });
@@ -5524,8 +5710,8 @@ export class SheetView extends TextFileView {
 
 	/* ---------------- Charts ---------------- */
 
-	/** Draws the charts again once the current work is done (they read the cells). */
-	private queueCharts(): void {
+	/** Draws the charts, floating images and the copy outline again once the current work is done. */
+	queueCharts(): void {
 		if (this.chartFrame) return;
 		this.chartFrame = window.requestAnimationFrame(() => {
 			this.chartFrame = 0;
@@ -5559,71 +5745,191 @@ export class SheetView extends TextFileView {
 		if (!hot || hot.isDestroyed || !layer || !layer.isConnected) return;
 		layer.empty();
 		const origin = this.chartOrigin(hot);
-		for (const img of this.model.floatingImages)
-			this.renderFloatingImage(layer, img, origin);
-		const read = (row: number, col: number): Scalar =>
-			this.resolveRaw(this.rawCell(this.activeSheet, row, col), 0, true, {
-				row,
-				col,
-			});
-		for (const chart of this.model.charts) {
-			const box = layer.createDiv({ cls: 'rtl-sheet-chart' });
-			box.toggleClass('is-editing', chart.id === this.chartEditorId);
-			this.placeChart(box, chart, origin);
-			// Presses on a chart must not select cells or start editing them.
-			for (const type of [
-				'mousedown',
-				'pointerdown',
-				'touchstart',
-				'dblclick',
-				'contextmenu',
-			])
-				box.addEventListener(type, (e) => e.stopPropagation(), {
-					passive: true,
-				});
-
-			const head = box.createDiv({ cls: 'rtl-sheet-chart-head' });
-			head.style.height = `${CHART_HEAD_H * this.zoomY}px`;
-			head.style.fontSize = `${Math.round(13 * this.zoomY * 10) / 10}px`;
-			const title = head.createSpan({
-				cls: 'rtl-sheet-chart-title',
-				text: chart.title || 'Chart',
-				attr: { dir: 'auto' },
-			});
-			if (chart.titleColor) title.style.color = chart.titleColor;
-			const editBtn = head.createEl('button', {
-				cls: 'rtl-sheet-chart-btn',
-				attr: { 'aria-label': 'Edit chart', title: 'Edit chart' },
-			});
-			setIcon(editBtn, 'pencil');
-			editBtn.addEventListener('click', () => this.editChart(chart.id));
-			const deleteBtn = head.createEl('button', {
-				cls: 'rtl-sheet-chart-btn',
-				attr: { 'aria-label': 'Delete chart', title: 'Delete chart' },
-			});
-			setIcon(deleteBtn, 'trash-2');
-			deleteBtn.addEventListener('click', () => this.deleteChart(chart.id));
-			head.addEventListener('pointerdown', (e) =>
-				this.onChartDrag(e, box, chart.id, 'move'),
-			);
-
-			const body = box.createDiv({ cls: 'rtl-sheet-chart-body' });
-			body.addEventListener('dblclick', () => this.editChart(chart.id));
-			renderChart(
-				body,
-				chart,
-				readChartData(chart, read),
-				chart.w,
-				chart.h - CHART_HEAD_H,
-			);
-			const grip = box.createDiv({
-				cls: 'rtl-sheet-chart-grip',
-				attr: { 'aria-label': 'Resize chart' },
-			});
-			grip.addEventListener('pointerdown', (e) =>
-				this.onChartDrag(e, box, chart.id, 'resize'),
-			);
+		this.renderCopyMark(hot, layer, origin);
+		const read = this.chartReader();
+		// From the bottom up: later boxes cover earlier ones.
+		for (const entry of this.layerOrder()) {
+			if (entry.kind === 'image')
+				this.renderFloatingImage(layer, entry.item, origin);
+			else this.renderChartBox(layer, entry.item, origin, read);
 		}
+	}
+
+	private renderChartBox(
+		layer: HTMLElement,
+		chart: ChartSpec,
+		origin: { x: number; y: number },
+		read: (row: number, col: number) => Scalar,
+	): void {
+		const box = layer.createDiv({ cls: 'rtl-sheet-chart' });
+		box.toggleClass('is-editing', chart.id === this.chartEditorId);
+		this.placeChart(box, chart, origin);
+		// Presses on a chart must not select cells or start editing them.
+		for (const type of [
+			'mousedown',
+			'pointerdown',
+			'touchstart',
+			'dblclick',
+			'contextmenu',
+		])
+			box.addEventListener(type, (e) => e.stopPropagation(), {
+				passive: true,
+			});
+
+		const head = box.createDiv({ cls: 'rtl-sheet-chart-head' });
+		head.style.height = `${CHART_HEAD_H * this.zoomY}px`;
+		head.style.fontSize = `${Math.round(13 * this.zoomY * 10) / 10}px`;
+		const title = head.createSpan({
+			cls: 'rtl-sheet-chart-title',
+			text: chart.title || 'Chart',
+			attr: { dir: 'auto' },
+		});
+		if (chart.titleColor) title.style.color = chart.titleColor;
+		const editBtn = head.createEl('button', {
+			cls: 'rtl-sheet-chart-btn',
+			attr: { 'aria-label': 'Edit chart', title: 'Edit chart' },
+		});
+		setIcon(editBtn, 'pencil');
+		editBtn.addEventListener('click', () => this.editChart(chart.id));
+		const layersBtn = head.createEl('button', {
+			cls: 'rtl-sheet-chart-btn',
+			attr: { 'aria-label': 'Arrange', title: 'Arrange' },
+		});
+		setIcon(layersBtn, 'layers');
+		layersBtn.addEventListener('click', () =>
+			this.showMenu(layersBtn, this.layerMenuEntries(chart.id)),
+		);
+		box.addEventListener('contextmenu', (e) => {
+			e.preventDefault();
+			this.showMenu(e, [
+				{
+					title: 'Edit chart',
+					icon: 'pencil',
+					onClick: () => this.editChart(chart.id),
+				},
+				...this.layerMenuEntries(chart.id),
+				{
+					title: 'Delete chart',
+					icon: 'trash-2',
+					onClick: () => this.deleteChart(chart.id),
+				},
+			]);
+		});
+		const deleteBtn = head.createEl('button', {
+			cls: 'rtl-sheet-chart-btn',
+			attr: { 'aria-label': 'Delete chart', title: 'Delete chart' },
+		});
+		setIcon(deleteBtn, 'trash-2');
+		deleteBtn.addEventListener('click', () => this.deleteChart(chart.id));
+		head.addEventListener('pointerdown', (e) =>
+			this.onChartDrag(e, box, chart.id, 'move'),
+		);
+
+		const body = box.createDiv({ cls: 'rtl-sheet-chart-body' });
+		body.addEventListener('dblclick', () => this.editChart(chart.id));
+		renderChart(
+			body,
+			chart,
+			readChartData(chart, read),
+			chart.w,
+			chart.h - CHART_HEAD_H,
+		);
+		const grip = box.createDiv({
+			cls: 'rtl-sheet-chart-grip',
+			attr: { 'aria-label': 'Resize chart' },
+		});
+		grip.addEventListener('pointerdown', (e) =>
+			this.onChartDrag(e, box, chart.id, 'resize'),
+		);
+	}
+
+	/** Charts and floating images from the bottom up: by `z`, images first when it is the same. */
+	private layerOrder(): (
+		| { kind: 'image'; item: FloatingImage }
+		| { kind: 'chart'; item: ChartSpec }
+	)[] {
+		const list = [
+			...this.model.floatingImages.map((item) => ({
+				kind: 'image' as const,
+				item,
+			})),
+			...this.model.charts.map((item) => ({
+				kind: 'chart' as const,
+				item,
+			})),
+		];
+		return list
+			.map((entry, i) => ({ entry, i }))
+			.sort(
+				(a, b) =>
+					(a.entry.item.z ?? 0) - (b.entry.item.z ?? 0) || a.i - b.i,
+			)
+			.map((e) => e.entry);
+	}
+
+	/** The `z` that puts a new chart or floating image on top of the others. */
+	private topZ(): number {
+		let top = 0;
+		for (const { item } of this.layerOrder())
+			top = Math.max(top, (item.z ?? 0) + 1);
+		return top;
+	}
+
+	/** Moves a chart or floating image up or down the stack (one undo step). */
+	private restack(
+		id: string,
+		move: 'front' | 'forward' | 'backward' | 'back',
+	): void {
+		const order = this.layerOrder();
+		const i = order.findIndex((e) => e.item.id === id);
+		const entry = order[i];
+		if (!entry) return;
+		order.splice(i, 1);
+		const j =
+			move === 'front'
+				? order.length
+				: move === 'back'
+					? 0
+					: move === 'forward'
+						? Math.min(order.length, i + 1)
+						: Math.max(0, i - 1);
+		if (j === i) return; // already there
+		order.splice(j, 0, entry);
+		const z = new Map(order.map((e, k) => [e.item.id, k]));
+		// Replaced, never changed in place (undo compares them).
+		this.model.charts = this.model.charts.map((c) =>
+			c.z === z.get(c.id) ? c : { ...c, z: z.get(c.id) },
+		);
+		this.model.floatingImages = this.model.floatingImages.map((f) =>
+			f.z === z.get(f.id) ? f : { ...f, z: z.get(f.id) },
+		);
+		this.markDirty();
+		this.queueCharts();
+	}
+
+	private layerMenuEntries(id: string): MenuEntry[] {
+		return [
+			{
+				title: 'Bring to front',
+				icon: 'bring-to-front',
+				onClick: () => this.restack(id, 'front'),
+			},
+			{
+				title: 'Bring forward',
+				icon: 'arrow-up',
+				onClick: () => this.restack(id, 'forward'),
+			},
+			{
+				title: 'Send backward',
+				icon: 'arrow-down',
+				onClick: () => this.restack(id, 'backward'),
+			},
+			{
+				title: 'Send to back',
+				icon: 'send-to-back',
+				onClick: () => this.restack(id, 'back'),
+			},
+		];
 	}
 
 	private placeChart(
@@ -5870,8 +6176,8 @@ export class SheetView extends TextFileView {
 		const area = single
 			? this.dataRegion(hot, selected.r1, selected.c1)
 			: { ...selected };
-		// Scatter charts: the first column holds the X values, the others the Y values.
-		const split = type === 'scatter' && area.c2 > area.c1;
+		// The first column holds the labels (X values), the others the values.
+		const split = area.c2 > area.c1;
 		const range = split ? { ...area, c1: area.c1 + 1 } : area;
 		const xRange = split ? { ...area, c2: area.c1 } : undefined;
 		const read = this.chartReader();
@@ -5894,6 +6200,7 @@ export class SheetView extends TextFileView {
 			y,
 			w: CHART_DEFAULT_W,
 			h: CHART_DEFAULT_H,
+			z: this.topZ(),
 		};
 		// The chart appears right away; the editor changes it from there.
 		this.model.charts = [...this.model.charts, spec];
@@ -6169,6 +6476,8 @@ export class SheetView extends TextFileView {
 
 	/** Ctrl+V / long-press paste of an image straight into the selected cell. */
 	private onPaste(e: ClipboardEvent): void {
+		// Any paste ends the copy outline, also one into a cell being edited or an image.
+		this.clearCopyMark();
 		const items = e.clipboardData?.items;
 		if (!items) return;
 		for (const item of Array.from(items)) {
@@ -6404,6 +6713,10 @@ export class SheetView extends TextFileView {
 			| { isOpened?: () => boolean }
 			| undefined;
 		if (editor?.isOpened?.()) return; // the user is editing text, not clearing cells
+		if (e.key === 'Escape') {
+			this.clearCopyMark();
+			return;
+		}
 		if (e.key === ' ' && !e.ctrlKey && !e.metaKey && !e.altKey) {
 			// Space checks or unchecks the selected check boxes (like Google Sheets).
 			const cells = this.selectedCheckboxCells();
@@ -6492,7 +6805,15 @@ export class SheetView extends TextFileView {
 		let y = 0;
 		for (let r = 0; r < cell.row; r++)
 			y += this.model.rowHeights[r] || this.computeRowHeight(r);
-		const img: FloatingImage = { id: newChartId('img'), path, x, y, w, h };
+		const img: FloatingImage = {
+			id: newChartId('img'),
+			path,
+			x,
+			y,
+			w,
+			h,
+			z: this.topZ(),
+		};
 		this.model.floatingImages = [...this.model.floatingImages, img];
 		this.activeFloatId = img.id;
 		this.markDirty();
@@ -6504,7 +6825,10 @@ export class SheetView extends TextFileView {
 		img: FloatingImage,
 		origin: { x: number; y: number },
 	): void {
-		const box = layer.createDiv({ cls: 'rtl-sheet-float-img' });
+		const box = layer.createDiv({
+			cls: 'rtl-sheet-float-img',
+			attr: { 'data-id': img.id },
+		});
 		box.toggleClass('is-active', img.id === this.activeFloatId);
 		this.placeChart(box, img, origin);
 		// Presses on the image must not select cells or start editing them.
@@ -6529,6 +6853,26 @@ export class SheetView extends TextFileView {
 		});
 		setIcon(deleteBtn, 'trash-2');
 		deleteBtn.addEventListener('click', () => this.deleteFloatingImage(img.id));
+		const layersBtn = box.createEl('button', {
+			cls: 'rtl-sheet-float-btn is-layers',
+			attr: { 'aria-label': 'Arrange', title: 'Arrange' },
+		});
+		setIcon(layersBtn, 'layers');
+		layersBtn.addEventListener('click', () =>
+			this.showMenu(layersBtn, this.layerMenuEntries(img.id)),
+		);
+		box.addEventListener('contextmenu', (e) => {
+			e.preventDefault();
+			this.setActiveFloat(img.id);
+			this.showMenu(e, [
+				...this.layerMenuEntries(img.id),
+				{
+					title: 'Delete image',
+					icon: 'trash-2',
+					onClick: () => this.deleteFloatingImage(img.id),
+				},
+			]);
+		});
 		const grip = box.createDiv({
 			cls: 'rtl-sheet-chart-grip',
 			attr: { 'aria-label': 'Resize image' },
@@ -6559,12 +6903,9 @@ export class SheetView extends TextFileView {
 		if (this.activeFloatId === id) return;
 		this.activeFloatId = id;
 		this.chartLayer
-			?.querySelectorAll('.rtl-sheet-float-img')
-			.forEach((el, i) =>
-				el.toggleClass(
-					'is-active',
-					this.model.floatingImages[i]?.id === id && id !== null,
-				),
+			?.querySelectorAll<HTMLElement>('.rtl-sheet-float-img')
+			.forEach((el) =>
+				el.toggleClass('is-active', id !== null && el.dataset.id === id),
 			);
 	}
 
