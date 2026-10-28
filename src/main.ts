@@ -2510,11 +2510,7 @@ export class SheetView extends TextFileView {
 	 * old height. Ask it to read the heights again.
 	 */
 	private invalidateGridRowHeights(): void {
-		const hot = this.hot as
-			| (Handsontable.Core & {
-					view?: { invalidateRowHeightCache?: () => void };
-			  })
-			| null;
+		const hot = this.hot;
 		if (hot && !hot.isDestroyed) hot.view?.invalidateRowHeightCache?.();
 	}
 
