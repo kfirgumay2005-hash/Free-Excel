@@ -2170,6 +2170,7 @@ export class SheetView extends TextFileView {
 					this.formulaCache.clear();
 					this.spillCache.clear();
 					this.borderGridCache = null;
+					this.invalidateGridRowHeights();
 				},
 				// Charts follow their data: draw them again after every full render.
 				afterRender: (isForced) => {
@@ -2259,6 +2260,8 @@ export class SheetView extends TextFileView {
 					this.model.colWidths[column] = Math.round(
 						newSize / this.zoom,
 					);
+					// Wrapped text in the column now takes a different number of lines.
+					this.invalidateRowSizes();
 					this.markDirty();
 				},
 				afterRowResize: (newSize, row) => {
@@ -2498,6 +2501,21 @@ export class SheetView extends TextFileView {
 		this.formulaCache.clear();
 		this.spillCache.clear();
 		this.borderGridCache = null;
+		this.invalidateGridRowHeights();
+	}
+
+	/**
+	 * Handsontable caches the results of the `rowHeights` function and only drops them on
+	 * `updateSettings`, so a row whose wrapped text got fewer lines (a wider column) kept its
+	 * old height. Ask it to read the heights again.
+	 */
+	private invalidateGridRowHeights(): void {
+		const hot = this.hot as
+			| (Handsontable.Core & {
+					view?: { invalidateRowHeightCache?: () => void };
+			  })
+			| null;
+		if (hot && !hot.isDestroyed) hot.view?.invalidateRowHeightCache?.();
 	}
 
 	/**
